@@ -1,0 +1,23 @@
+{
+  "bind_host": "127.0.0.1",
+  "port": 8765,
+  "allowed_hosts": [],
+  "human_owner": "Rich",
+  "watcher_name": "taskbench-local",
+  "data_dir": "var",
+  "projects_dir": "projects",
+  "runners": {
+    "grok-build": {
+      "adapter": "grok_build",
+      "executable": "grok",
+      "args_template": [
+        "--prompt-file",
+        "{prompt_file}",
+        "--cwd",
+        "{project_dir}"
+      ],
+      "can_ask": true,
+      "sandbox_only": false
+    }
+  }
+}

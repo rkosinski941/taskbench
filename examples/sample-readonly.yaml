@@ -1,0 +1,36 @@
+schema: joy-feeder.task/v2
+id: jf-sample-readonly-001
+created: 2026-10-17T18:00:00-04:00
+from: Joy Feeder
+runner:
+  requested: grok-build
+  actual: null        # written by the runner
+model:
+  requested: null     # runner default
+  actual: null        # written by the runner
+project: demo-canvas
+permissions: plan
+timeout_s: 600
+goal: >
+  Review canvas-v2.html for correctness and performance. Report bugs with
+  line numbers and a suggested fix for each. Do not change any files.
+constraints:
+  - Read-only. No edits, no servers, no installs.
+  - Keep the report under 300 words.
+success_criteria:
+  - Each finding names a line and a concrete fix
+  - The report says plainly if no bugs were found
+return:
+  path: outbox/joy-feeder/done/
+  notify: none
+priority: normal
+due: null
+files:
+  - canvas-v2.html
+review_by: null
+status: incoming
+claimed_by: null
+claimed_at: null
+worker_thread: null
+retro: null
+result: null
