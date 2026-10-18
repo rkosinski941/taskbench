@@ -85,8 +85,10 @@ class GrokBuildAdapter(Adapter):
         """Read a streaming-messages init event, or a TASKBENCH action line.
 
         ``permissionMode`` is documented on the ``system``/``init`` line of
-        ``--output-format streaming-messages-json``. Other native JSON events
-        are ignored here. The test stub still speaks TASKBENCH for actions.
+        ``--output-format streaming-messages-json``. A ``result`` line's
+        ``result`` string is the assistant summary. Other native JSON events
+        are ignored (``type: ignore``) so the raw JSON is not treated as
+        assistant text. The test stub still speaks TASKBENCH for actions.
         """
         stripped = line.strip()
         if stripped.startswith("{"):
@@ -102,5 +104,15 @@ class GrokBuildAdapter(Adapter):
                     "permissionMode": payload.get("permissionMode", payload.get("permission_mode")),
                     "init": True,
                 }
-            return None
+            if payload.get("type") == "result":
+                summary = payload.get("result")
+                if not isinstance(summary, str):
+                    summary = payload.get("summary") if isinstance(payload.get("summary"), str) else ""
+                artifacts = payload.get("artifacts")
+                return {
+                    "type": "result",
+                    "summary": summary,
+                    "artifacts": artifacts if isinstance(artifacts, list) else [],
+                }
+            return {"type": "ignore"}
         return super().parse_line(line)

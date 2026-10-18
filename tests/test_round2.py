@@ -132,7 +132,7 @@ class ProjectRuleTests(TempApp):
             base_packet(id="rules-1", permissions="plan", timeout_s=30),
         )
         run_until(watcher, lambda: packet_status(self.store, "rules-1") == "blocked")
-        saved = parse_yaml((self.store.outbox / "rules-1.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "rules-1.json").read_text(encoding="utf-8"))
         reason = saved["result"]["blocked_reason"]
         self.assertTrue(reason.startswith("Needs you"))
         self.assertIn(".grok/config.toml", reason)

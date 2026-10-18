@@ -125,9 +125,12 @@ moves a packet between states, and every change goes in the run log.
     from `review_by` (default `plan`), the same `project`, and a goal of
     "Review the changes made by `<id>`" with the first result attached. The
     child's id goes in the parent's `result.review_task`.
-12. **Every run is plain files.** The outbox gets `<id>.yaml` (the final
-    packet), `<id>.prompt.md` (the exact prompt sent), and `<id>.output.log`
-    (the full runner output).
+12. **Every run is plain files.** Incoming packets may be YAML or JSON.
+    The watcher stores its copy as `<id>.json` so model-written summary and
+    retro text are never parsed again as YAML. The outbox also gets
+    `<id>.prompt.md` (the prompt, with secrets redacted) and `<id>.output.log`
+    (assistant text, the summary, redacted stderr, and tool metadata — not
+    raw tool results).
 13. **Working directory.** `workdir`, when set, is an absolute folder. The
     watcher resolves symlinks and Windows junctions first (`realpath`), then
     rejects a path that does not exist, is not a directory, is a drive root,

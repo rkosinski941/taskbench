@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from taskbench.atomic import atomic_write_text
+from taskbench.redact import redact
 
 
 def project_dir(projects_root: Path, name: str) -> Path:
@@ -62,7 +63,7 @@ def write_last_agent(
     status: str,
     summary: str,
 ) -> None:
-    one_line = " ".join(summary.split())
+    one_line = " ".join(redact(summary).split())
     if len(one_line) > 300:
         one_line = one_line[:300].rstrip()
     text = (

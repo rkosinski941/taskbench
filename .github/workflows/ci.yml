@@ -6,17 +6,18 @@ on:
 
 jobs:
   test:
-    name: tests (${{ matrix.os }})
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12" # minimum supported is 3.11 (tomllib)
+          python-version: ${{ matrix.python }}
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 

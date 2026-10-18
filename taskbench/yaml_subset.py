@@ -14,9 +14,16 @@ the Python standard library. Supported, and tested:
   and not inside quotes
 * ``key:`` with an empty value, meaning a nested block or null
 
-Not supported: anchors, aliases, tags, multi-document streams, flow mappings,
-quoted keys, and merge keys. A sequence scalar that contains ``": "`` is
-parsed as a mapping entry; quote it if that is not what you want.
+Not supported, and rejected: anchors (``&``), aliases (``*``), tags
+(``!`` / ``!!``), multi-document markers (``---``, ``...``), flow mappings,
+quoted keys, merge keys, and duplicate keys. A sequence scalar that contains
+``": "`` is parsed as a mapping entry; quote it if that is not what you want.
+
+Lines are split on ``\\n`` only, after ``\\r\\n`` is normalized to ``\\n``.
+A lone ``\\r``, U+0085, U+2028, U+2029, or other control character is not a
+line break. The writer emits any string that contains one of those as a
+double-quoted JSON scalar (``ensure_ascii``) so it cannot become a new key
+on the way back in.
 
 The writer emits this same subset. Parse, emit, parse is stable for values
 taskbench stores. Folded scalars come back as plain or quoted strings, so the
@@ -53,9 +60,19 @@ def dump(value: Any) -> str:
     return rendered
 
 
+def _document_lines(text: str) -> list[str]:
+    """Split on ``\\n`` only. ``\\r\\n`` is normalized first; lone ``\\r`` is not."""
+    normalized = text.replace("\r\n", "\n")
+    if normalized.endswith("\n"):
+        normalized = normalized[:-1]
+    if normalized == "":
+        return []
+    return normalized.split("\n")
+
+
 class _Parser:
     def __init__(self, text: str) -> None:
-        self.lines = text.splitlines()
+        self.lines = _document_lines(text)
         self.n = len(self.lines)
         self.i = 0
 
@@ -66,6 +83,10 @@ class _Parser:
         line = self.lines[self.i]
         indent = _indent(line, self.i)
         stripped = line.strip()
+        _reject_yaml_feature(stripped, self.i)
+        if stripped in {"{}", "[]"}:
+            self.i += 1
+            return {} if stripped == "{}" else []
         if stripped.startswith("- "):
             return self._parse_sequence(indent)
         return self._parse_mapping(indent)
@@ -81,6 +102,7 @@ class _Parser:
             if current < indent:
                 break
             stripped = line.strip()
+            _reject_yaml_feature(stripped, self.i)
             if stripped.startswith("- "):
                 break
             if current > indent:
@@ -88,6 +110,8 @@ class _Parser:
                     f"line {self.i + 1}: unexpected indent {current}, expected {indent}"
                 )
             key, rest = _split_key(stripped, self.i)
+            if key in result:
+                raise YamlSubsetError(f"line {self.i + 1}: duplicate key {key!r}")
             self.i += 1
             result[key] = self._parse_value(rest, indent)
         return result
@@ -110,6 +134,7 @@ class _Parser:
                     f"line {self.i + 1}: unexpected indent in sequence"
                 )
             rest = stripped[2:]
+            _reject_yaml_feature(rest.strip(), self.i)
             self.i += 1
             if rest.strip() == "":
                 items.append(self._parse_value("", indent))
@@ -126,6 +151,11 @@ class _Parser:
                 else:
                     item[key] = _parse_scalar(valpart)
                 extra = self._parse_mapping(child_indent)
+                for extra_key in extra:
+                    if extra_key in item:
+                        raise YamlSubsetError(
+                            f"line {self.i + 1}: duplicate key {extra_key!r}"
+                        )
                 item.update(extra)
                 items.append(item)
             else:
@@ -232,6 +262,20 @@ def _indent(line: str, index: int) -> int:
     return count
 
 
+def _reject_yaml_feature(text: str, index: int) -> None:
+    """Reject anchors, aliases, tags, and document markers as tokens."""
+    stripped = text.strip()
+    if not stripped:
+        return
+    if stripped in {"---", "..."} or stripped.startswith("--- ") or stripped.startswith("... "):
+        raise YamlSubsetError(f"line {index + 1}: document markers are not supported")
+    token = stripped
+    if token[0] in "'\"":
+        return
+    if token.startswith(("!", "&", "*")):
+        raise YamlSubsetError(f"line {index + 1}: anchors, aliases, and tags are not supported")
+
+
 def _split_key(stripped: str, index: int) -> tuple[str, str]:
     if stripped.startswith('"') or stripped.startswith("'"):
         raise YamlSubsetError(f"line {index + 1}: quoted keys are not supported")
@@ -241,7 +285,10 @@ def _split_key(stripped: str, index: int) -> tuple[str, str]:
     key = stripped[:colon].strip()
     if not key:
         raise YamlSubsetError(f"line {index + 1}: empty key")
+    if key.startswith(("!", "&", "*")):
+        raise YamlSubsetError(f"line {index + 1}: anchors, aliases, and tags are not supported")
     rest = stripped[colon + 1 :]
+    _reject_yaml_feature(rest, index)
     return key, rest
 
 
@@ -280,8 +327,14 @@ def _strip_comment(text: str) -> str:
 
 def _parse_scalar(text: str) -> Any:
     text = _strip_comment(text).strip()
+    if text.startswith(("!", "&", "*")):
+        raise YamlSubsetError("anchors, aliases, and tags are not supported")
     if text == "" or text in {"null", "Null", "NULL", "~"}:
         return None
+    if text == "{}":
+        return {}
+    if text == "[]":
+        return []
     if text in {"true", "True", "TRUE"}:
         return True
     if text in {"false", "False", "FALSE"}:
@@ -408,8 +461,9 @@ def _emit(value: Any, indent: int) -> str:
                 raise YamlSubsetError("nested sequences are not supported")
             scalar = _emit(item, 0)
             if "\n" in scalar:
-                lines.append(f"{pad}- {scalar.splitlines()[0]}")
-                for extra in scalar.splitlines()[1:]:
+                parts = scalar.split("\n")
+                lines.append(f"{pad}- {parts[0]}")
+                for extra in parts[1:]:
                     lines.append(f"{pad}  {extra}")
             else:
                 lines.append(f"{pad}- {scalar}")
@@ -437,28 +491,36 @@ def _emit_pair(key: str, value: Any, indent: int) -> str:
             return f"{pad}{key_text}: []"
         nested = _emit(value, indent + 2)
         return f"{pad}{key_text}:\n{nested}"
-    if isinstance(value, str) and "\n" in value:
-        style = "|-" if not value.endswith("\n") else "|"
-        body = value[:-1] if value.endswith("\n") else value
-        lines = [f"{pad}{key_text}: {style}"]
-        for line in body.split("\n"):
-            lines.append(f"{pad}  {line}" if line else f"{pad}  ")
-        return "\n".join(lines)
+    if isinstance(value, str) and (_must_quote(value) or "\n" in value):
+        return f"{pad}{key_text}: {json.dumps(value, ensure_ascii=True)}"
     return f"{pad}{key_text}: {_emit(value, indent)}"
+
+
+def _must_quote(value: str) -> bool:
+    """True when a character could be read as a line break or a separator."""
+    for char in value:
+        code = ord(char)
+        if char == "\n":
+            continue
+        if code < 32 or code == 127 or 0x80 <= code <= 0x9F or char in {"\u2028", "\u2029"}:
+            return True
+    return False
 
 
 def _emit_string(value: str) -> str:
     if value == "":
         return '""'
+    if _must_quote(value):
+        return json.dumps(value, ensure_ascii=True)
     if value in {"null", "Null", "NULL", "~", "true", "false", "True", "False"}:
         return json.dumps(value)
     if re.fullmatch(r"-?(0|[1-9][0-9]*)", value):
         return json.dumps(value)
     if "\n" in value:
-        return json.dumps(value)
+        return json.dumps(value, ensure_ascii=True)
     if _safe_plain(value):
         return value
-    return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=True)
 
 
 def _safe_plain(value: str) -> bool:
@@ -471,5 +533,7 @@ def _safe_plain(value: str) -> bool:
     if "#" in value:
         return False
     if any(ch in value for ch in "{}[],&*!|>%@`"):
+        return False
+    if _must_quote(value):
         return False
     return True

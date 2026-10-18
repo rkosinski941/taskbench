@@ -68,6 +68,32 @@ def make_config(
     )
 
 
+def login_session(port: int, app: App) -> tuple[str, str]:
+    """Consume the one-time login URL. Returns ``(csrf, cookie header)``."""
+    import http.client
+    import re
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/login?token=" + app.login_token)
+    response = conn.getresponse()
+    response.read()
+    set_cookie = response.getheader("Set-Cookie") or ""
+    status = response.status
+    conn.close()
+    if status != 303:
+        raise AssertionError(f"login failed: {status}")
+    cookie = set_cookie.split(";", 1)[0]
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/", headers={"Cookie": cookie})
+    page = conn.getresponse()
+    body = page.read()
+    conn.close()
+    match = re.search(br"name='csrf' value='([^']+)'", body)
+    if match is None:
+        raise AssertionError("csrf was not served after login")
+    return match.group(1).decode("ascii"), cookie
+
+
 def write_packet(inbox: Path, packet: dict) -> Path:
     inbox.mkdir(parents=True, exist_ok=True)
     path = inbox / f"{packet['id']}.yaml"

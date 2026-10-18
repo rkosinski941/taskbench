@@ -2,6 +2,7 @@
   "bind_host": "127.0.0.1",
   "port": 8765,
   "allowed_hosts": [],
+  "remote_approvals": false,
   "human_owner": "Rich",
   "watcher_name": "taskbench-local",
   "data_dir": "var",

@@ -22,7 +22,7 @@ should show. Generic project and runner names only.
 
 ## General checks
 
-- Every run leaves `<id>.yaml`, `<id>.prompt.md` and `<id>.output.log` in the
+- Every run leaves `<id>.json`, `<id>.prompt.md` and `<id>.output.log` in the
   outbox, even when it fails or times out.
 - `LAST_AGENT.md` is updated by the watcher on every terminal state,
   including `timed-out` and `failed`.

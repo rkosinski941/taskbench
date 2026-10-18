@@ -70,12 +70,16 @@ def classify(
     allow: list[str] | None,
     sandbox_only: bool,
     project_dir: Path,
+    denied_dirs: list[Path] | None = None,
 ) -> Decision:
     op = str(action.get("op") or "")
     command = full_command(action)
     patterns = list(allow or [])
     server = is_long_lived(action, command)
     plan_like = sandbox_only or permissions == "plan"
+
+    if _hits_denied(project_dir, action, denied_dirs or []):
+        return Decision("refuse", "path is inside a denied directory")
 
     if plan_like:
         if op in READ_ONLY_OPS and not server and _path_inside(project_dir, action):
@@ -260,6 +264,38 @@ def shell_argv(command: str) -> list[str]:
     if os.name == "nt":
         return ["cmd.exe", "/c", command]
     return ["/bin/sh", "-c", command]
+
+
+def _hits_denied(project_dir: Path, action: dict, denied_dirs: list[Path]) -> bool:
+    """True when a path resolves inside the pinned Grok home or another denied dir."""
+    if not denied_dirs:
+        return False
+    raw_paths = [action.get("path"), action.get("against")]
+    for raw in raw_paths:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        candidate = Path(raw)
+        target = candidate if candidate.is_absolute() else project_dir / candidate
+        try:
+            resolved = target.resolve(strict=False)
+        except OSError:
+            continue
+        for denied in denied_dirs:
+            try:
+                root = Path(denied).resolve(strict=False)
+            except OSError:
+                continue
+            if resolved == root or _is_under(resolved, root):
+                return True
+    return False
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _path_inside(project_dir: Path, action: dict) -> bool:

@@ -151,13 +151,34 @@ print(plan["kind"])
     return Get-FunnelKindFallback -ServeText $ServeText -ServeJson $ServeJson -FunnelText $FunnelText -Port $Port
 }
 
+function Test-TaskbenchPython {
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $py) {
+        throw "taskbench requires Python 3.11 or newer, and python was not found on PATH."
+    }
+    $raw = & $py.Source -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    if ($LASTEXITCODE -ne 0) {
+        throw "taskbench requires Python 3.11 or newer (could not read the version)."
+    }
+    $parts = "$raw".Trim().Split(".")
+    $major = [int]$parts[0]
+    $minor = [int]$parts[1]
+    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 11)) {
+        throw "taskbench requires Python 3.11 or newer (this is $raw)."
+    }
+}
+
 if (-not $WithTailscale) {
+    Test-TaskbenchPython
     Write-Step "taskbench install helper: no changes."
     Write-Step "Local app (loopback only): python -m taskbench --config config.json"
     Write-Step "Optional remote access is off. -WithTailscale needs your approval before it installs Tailscale or runs tailscale serve."
     Write-Step "Add -WhatIf to print those commands without running them."
     exit 0
 }
+
+Test-TaskbenchPython
 
 if (-not $ConfigPath) {
     $preferred = Join-Path $Root "config.json"

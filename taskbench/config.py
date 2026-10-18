@@ -84,6 +84,7 @@ class Config:
     poll_interval_s: float = 0.2
     runners: dict[str, RunnerConfig] = field(default_factory=dict)
     config_path: Path | None = None
+    remote_approvals: bool = False
 
 
 def load_config(path: Path) -> Config:
@@ -110,6 +111,9 @@ def load_config(path: Path) -> Config:
     data_dir = _resolve_dir(base, raw.get("data_dir", "var"), "data_dir")
     projects_dir = _resolve_dir(base, raw.get("projects_dir", "projects"), "projects_dir")
     runners = _load_runners(raw.get("runners", {}))
+    remote = raw.get("remote_approvals", False)
+    if remote is not True and remote is not False:
+        raise ConfigError("remote_approvals must be a boolean")
     loaded = Config(
         bind_host=bind_host,
         port=port,
@@ -120,6 +124,7 @@ def load_config(path: Path) -> Config:
         projects_dir=projects_dir,
         config_path=path.resolve(),
         runners=runners,
+        remote_approvals=remote is True,
     )
     return loaded
 

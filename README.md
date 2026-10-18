@@ -35,9 +35,9 @@ packet in `var/inbox/`. Examples live in `examples/`.
 | `var/claimed/` | `claimed` (queued) |
 | `var/running/` | `running` |
 | `var/needs-approval/` | `needs-approval` |
-| `var/outbox/<id>.yaml` | `done`, `failed`, `blocked`, `timed-out` |
-| `var/outbox/<id>.prompt.md` | prompt that was sent |
-| `var/outbox/<id>.output.log` | stdout, stderr, and the final status |
+| `var/outbox/<id>.json` | `done`, `failed`, `blocked`, `timed-out` |
+| `var/outbox/<id>.prompt.md` | prompt that was sent, secrets redacted |
+| `var/outbox/<id>.output.log` | assistant text, summary, redacted stderr, tool metadata |
 | `projects/<name>/.taskbench/LAST_AGENT.md` | watcher handoff, every terminal state |
 
 The watcher is the only writer of `status`. A transition writes the
@@ -61,7 +61,14 @@ can still answer; the dead process group is killed first.
   Writes under `<project>/.taskbench` are refused.
 - The page binds to `127.0.0.1` and refuses any other address. `Host` must be
   `127.0.0.1` or `localhost` (with the port), plus names listed in
-  `allowed_hosts` (empty by default). POST checks a per-session CSRF cookie.
+  `allowed_hosts` (empty by default). Startup prints a one-time login URL
+  on the console. Opening it sets an HttpOnly `SameSite=Strict` session
+  cookie. State-changing POSTs need that cookie and the CSRF token, which
+  is not sent to a cookieless request. `Origin` must match, and
+  `Sec-Fetch-Site`, when the browser sends it, must be `same-origin` or
+  `none`. Folder registration and approvals are refused when the request
+  came through Tailscale Serve unless `remote_approvals` is `true`
+  (default `false`).
 - Grok Build is pinned to `--permission-mode dontAsk` and `--sandbox strict`.
   For the `grok` executable those flags are the first arguments. A later copy
   is removed, so nothing after the pins can override them. When the executable
@@ -98,9 +105,11 @@ can still answer; the dead process group is killed first.
   there. `--permission-mode dontAsk` overrides a config `permission_mode`
   or `yolo`, but an explicit allow rule in the user config can still
   auto-approve inside that sandbox. `/etc/grok` cannot be redirected.
-  Packet files stay on the YAML subset in `taskbench/yaml_subset.py`
-  because the task spec is YAML and the standard library has no YAML
-  parser. That limit is written down in `docs/parsers.md`.
+  Incoming packets may be YAML or JSON. The watcher stores its copy as
+  JSON so a model-written summary cannot change control fields. The YAML
+  subset splits on newline only, escapes separator characters on write,
+  and rejects duplicate keys, anchors, aliases, and tags. See
+  `docs/parsers.md`.
 - Windows has no OS sandbox. Grok's `--sandbox strict` is Landlock and
   Seatbelt only, and the CLI continues when it cannot apply a sandbox.
   taskbench still runs on Windows. It shows `No OS sandbox on Windows; only taskbench approvals protect you`
@@ -283,22 +292,28 @@ and refused if it changed.
 Missing paths, files, and drive roots are rejected. So are the user profile
 itself, `Documents`, `Desktop`, `Downloads`, and `OneDrive` (including
 `OneDrive - *`) themselves. A subfolder of those personal folders is
-allowed. Anything inside `AppData`, anything inside a dot-folder under the
-profile (`.ssh`, `.grok`, `.claude`, and any other `.*`), and the taskbench
-install, config, and state folders are rejected. A folder that contains
-one of those (an ancestor of a denied path) is rejected. A hidden directory
-inside the chosen folder is also rejected, except `.grok` and `.claude`
-(the allow-rule scan reports those), `.git`, `.github`, and `.taskbench`
-(the watcher creates `.taskbench` for `LAST_AGENT.md`).
+allowed. Anything inside `AppData`, a dot-folder directly under the
+profile (`.ssh`, `.grok`, `.claude`, and any other `.*` there, including
+their children), and the taskbench install, config, and state folders are
+rejected. A folder that is an ancestor of one of those is rejected.
+A hidden directory inside a project (`.vscode`, `node_modules/x/.bin`) is
+not a reason to reject the project. Admin shares (`C$`, `ADMIN$`, `IPC$`)
+and `\\localhost\C$\...` are rejected.
 
 System folders include `Windows`, `System32`, `Program Files`,
 `Program Files (x86)`, and `ProgramData` on Windows, and `/`, `/etc`,
 `/usr`, `/bin`, and `/System` on POSIX.
 
+On Windows the run holds an open directory handle on the workdir without
+`FILE_SHARE_DELETE` until the run, including the retro follow-up, finishes.
+On POSIX, opening the directory does not stop a parent rename after the
+pre-launch re-check. That residual swap window remains.
+
 A packet never registers a folder, whatever `from` says. The owner
-registers one by posting to the local page. That request must carry the
-per-launch token kept in server memory, and its Origin and Host must be
-`127.0.0.1`, `localhost`, or a name in `allowed_hosts`. The registry lives
+registers one from the local page after opening the one-time console URL.
+That POST needs the session cookie and the CSRF token. It is refused when
+`Tailscale-User-Login` is set or the Host is an `allowed_hosts` name,
+unless `remote_approvals` is true. The registry lives
 in taskbench's data directory (`workdir-registry.json`), not in the repo.
 An unregistered folder is `needs-approval`, shown as **Needs you**, with
 the resolved path on the task. A rejected path is `blocked` with reason

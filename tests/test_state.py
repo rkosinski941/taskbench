@@ -17,7 +17,7 @@ class StateMachineTests(TempApp):
         write_packet(self.store.inbox, base_packet(id="b-next", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "a-hang") == "running")
         self.assertEqual(packet_status(self.store, "b-next"), "claimed")
-        self.assertEqual(len(list(self.store.running.glob("*.yaml"))), 1)
+        self.assertEqual(len(list(self.store.running.glob("*.json"))), 1)
 
     def test_recover_keeps_further_state_and_drops_tmp(self) -> None:
         store = StateStore(self.root / "var")
@@ -27,7 +27,7 @@ class StateMachineTests(TempApp):
         (store.inbox / "partial.yaml.tmp").write_text("nope", encoding="utf-8")
         notes = store.recover()
         self.assertFalse((store.inbox / "dup-1.yaml").exists())
-        self.assertTrue((store.claimed / "dup-1.yaml").exists())
+        self.assertTrue((store.claimed / "dup-1.json").exists())
         self.assertFalse((store.inbox / "partial.yaml.tmp").exists())
         self.assertTrue(any("kept claimed" in note for note in notes))
 
@@ -37,8 +37,8 @@ class StateMachineTests(TempApp):
         store.write_packet("running", base_packet(id="done-1", status="running"))
         store.write_packet("outbox", packet)
         store.recover()
-        self.assertFalse((store.running / "done-1.yaml").exists())
-        self.assertTrue((store.outbox / "done-1.yaml").exists())
+        self.assertFalse((store.running / "done-1.json").exists())
+        self.assertTrue((store.outbox / "done-1.json").exists())
 
 
 if __name__ == "__main__":

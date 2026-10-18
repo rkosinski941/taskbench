@@ -18,9 +18,9 @@ class WatcherArtifactTests(TempApp):
         prompt = (self.store.outbox / "art-1.prompt.md").read_text(encoding="utf-8")
         self.assertTrue(prompt.startswith(instructions.strip()))
         self.assertIn("LAST_AGENT.md", prompt)
-        self.assertTrue((self.store.outbox / "art-1.yaml").is_file())
+        self.assertTrue((self.store.outbox / "art-1.json").is_file())
         self.assertTrue((self.store.outbox / "art-1.output.log").is_file())
-        saved = parse_yaml((self.store.outbox / "art-1.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "art-1.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["model"]["actual"], "grok-fixture-1")
         self.assertEqual(saved["runner"]["actual"], "grok-build")
         self.assertEqual(saved["retro"]["fit_1_5"], 4)
@@ -49,7 +49,7 @@ class WatcherArtifactTests(TempApp):
         _config, _app, watcher = self.make(scenario="needs-retro-followup")
         write_packet(self.store.inbox, base_packet(id="retro-1", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "retro-1") == "done", timeout=10)
-        saved = parse_yaml((self.store.outbox / "retro-1.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "retro-1.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["retro"]["effort"], "The follow-up.")
         self.assertEqual(saved["retro"]["fit_1_5"], 3)
 
@@ -57,7 +57,7 @@ class WatcherArtifactTests(TempApp):
         _config, _app, watcher = self.make(scenario="exit-no-result")
         write_packet(self.store.inbox, base_packet(id="fail-1", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "fail-1") == "failed")
-        for suffix in (".yaml", ".prompt.md", ".output.log"):
+        for suffix in (".json", ".prompt.md", ".output.log"):
             self.assertTrue((self.store.outbox / f"fail-1{suffix}").is_file(), suffix)
         handoff = (self.root / "projects" / "demo-canvas" / ".taskbench" / "LAST_AGENT.md").read_text(encoding="utf-8")
         self.assertIn("status: failed", handoff)
@@ -75,7 +75,7 @@ class WatcherArtifactTests(TempApp):
         }
         write_packet(self.store.inbox, v1)
         run_until(watcher, lambda: packet_status(self.store, "old-9") == "blocked")
-        saved = parse_yaml((self.store.outbox / "old-9.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "old-9.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["result"]["blocked_reason"], V1_REASON)
         self.assertIsNone(saved["runner"]["actual"])
         output = (self.store.outbox / "old-9.output.log").read_text(encoding="utf-8")
@@ -90,8 +90,8 @@ class WatcherArtifactTests(TempApp):
             lambda: packet_status(self.store, "human-1") == "blocked"
             and packet_status(self.store, "path-1") == "blocked",
         )
-        human = parse_yaml((self.store.outbox / "human-1.yaml").read_text(encoding="utf-8"))
-        path = parse_yaml((self.store.outbox / "path-1.yaml").read_text(encoding="utf-8"))
+        human = parse_yaml((self.store.outbox / "human-1.json").read_text(encoding="utf-8"))
+        path = parse_yaml((self.store.outbox / "path-1.json").read_text(encoding="utf-8"))
         self.assertEqual(human["result"]["blocked_reason"], "invalid from")
         self.assertIn("invalid project", path["result"]["blocked_reason"])
 
@@ -101,10 +101,10 @@ class WatcherArtifactTests(TempApp):
         packet["review_by"] = {"runner": "grok-build", "model": None, "permissions": "plan"}
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "rev-1") == "done")
-        parent = parse_yaml((self.store.outbox / "rev-1.yaml").read_text(encoding="utf-8"))
+        parent = parse_yaml((self.store.outbox / "rev-1.json").read_text(encoding="utf-8"))
         self.assertEqual(parent["result"]["review_task"], "rev-1-review")
         run_until(watcher, lambda: packet_status(self.store, "rev-1-review") == "done", timeout=8)
-        child = parse_yaml((self.store.outbox / "rev-1-review.yaml").read_text(encoding="utf-8"))
+        child = parse_yaml((self.store.outbox / "rev-1-review.json").read_text(encoding="utf-8"))
         self.assertEqual(child["from"], "taskbench")
         self.assertEqual(child["permissions"], "plan")
         self.assertIn("Review the changes made by rev-1", child["goal"])

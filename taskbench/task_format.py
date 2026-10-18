@@ -4,8 +4,10 @@ The published field table lives in ``docs/joy-feeder-task-v2.md``. This module
 is the only place that interprets a packet. The watcher stores the dict this
 module returns and does not re-parse fields elsewhere.
 
-Packets on disk are YAML, using the subset in ``taskbench.yaml_subset``. JSON
-is not accepted.
+Incoming packets may be YAML (the subset in ``taskbench.yaml_subset``) or
+JSON. JSON is read with ``json.loads`` and duplicate keys are rejected.
+After the watcher accepts a packet it stores that copy as JSON, so a
+model-written summary or retro is never parsed again as YAML control data.
 
 Assumptions where the spec is silent are marked in the README. In short:
 
@@ -26,6 +28,7 @@ Assumptions where the spec is silent are marked in the README. In short:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,11 +71,43 @@ class InterpretedPacket:
 
 
 def parse_yaml(text: str) -> Any:
-    return load(text)
+    """Read a packet document. JSON is accepted; anything else uses the YAML subset."""
+    return parse_stored(text)
 
 
 def emit_yaml(packet: dict[str, Any]) -> str:
+    """YAML subset for an incoming packet a person or bot dropped in the inbox."""
     return dump(packet)
+
+
+def emit_stored(packet: dict[str, Any]) -> str:
+    """Watcher-owned packet. JSON, with non-ASCII escapes, so text cannot inject keys."""
+    return json.dumps(packet, indent=2, ensure_ascii=True) + "\n"
+
+
+def parse_stored(text: str) -> Any:
+    """JSON when the document starts with ``{`` or ``[``, otherwise the YAML subset."""
+    stripped = text.lstrip("\ufeff \t\r\n")
+    if stripped.startswith("{") or stripped.startswith("["):
+        return _load_json(text)
+    return load(text)
+
+
+def _load_json(text: str) -> Any:
+    def pairs(seq: list[tuple[str, Any]]) -> dict[str, Any]:
+        obj: dict[str, Any] = {}
+        for key, value in seq:
+            if key in obj:
+                raise YamlSubsetError(f"duplicate key {key!r}")
+            obj[key] = value
+        return obj
+
+    try:
+        return json.loads(text, object_pairs_hook=pairs)
+    except YamlSubsetError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise YamlSubsetError(f"invalid JSON: {exc}") from exc
 
 
 def interpret(data: Any, *, human_owner: str) -> InterpretedPacket:
@@ -383,7 +418,7 @@ def _now() -> str:
 
 def load_packet_text(text: str, *, human_owner: str) -> InterpretedPacket:
     try:
-        data = load(text)
+        data = parse_stored(text)
     except YamlSubsetError as exc:
         packet = _blocked_shell(reason=f"invalid YAML: {exc}", packet_id=_fallback_id(text))
         return InterpretedPacket(False, packet, packet["result"]["blocked_reason"])

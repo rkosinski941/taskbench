@@ -149,7 +149,7 @@ class RunnerReactionTests(TempApp):
         _config, _app, watcher = self.make(scenario="bad-permission")
         write_packet(self.store.inbox, base_packet(id="mode-bad", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "mode-bad") == "failed")
-        saved = parse_yaml((self.store.outbox / "mode-bad.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "mode-bad.json").read_text(encoding="utf-8"))
         self.assertIn("unexpected permission mode", saved["result"]["blocked_reason"])
         self.assertIn("always-approve", saved["result"]["blocked_reason"])
 
@@ -164,7 +164,7 @@ class RunnerReactionTests(TempApp):
         _config, _app, watcher = self.make(scenario="echo")
         write_packet(self.store.inbox, base_packet(id="confine-1", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "confine-1") == "failed")
-        saved = parse_yaml((self.store.outbox / "confine-1.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "confine-1.json").read_text(encoding="utf-8"))
         reason = saved["result"]["blocked_reason"]
         self.assertIn("process confinement", reason)
         self.assertIn("simulated job or process-group assignment failure", reason)

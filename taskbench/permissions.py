@@ -52,7 +52,6 @@ ENV_ALLOWLIST = (
     "TERM",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
-    "XAI_API_KEY",
 )
 
 # Canonical flag -> allowed values. Comparison is case-insensitive.
@@ -111,14 +110,20 @@ class PermissionFlagError(ValueError):
 
 
 def scrub_environment(base: dict[str, str]) -> dict[str, str]:
-    """Copy only allow-listed variables. Never pass ``PYTHONPATH`` or ``GROK_*``."""
+    """Copy only allow-listed variables. Never pass ``PYTHONPATH`` or ``GROK_*``.
+
+    ``XAI_API_KEY`` is not on this list. The guarded Grok launch adds it to
+    that one process. Companion dev servers stay on this allow-list.
+    """
+    from taskbench.redact import drop_from_env
+
     allowed = {name.upper() for name in ENV_ALLOWLIST}
     env: dict[str, str] = {}
     for key, value in base.items():
         if key.upper() in allowed:
             env[key] = value
     env["TASKBENCH_APPROVALS"] = "1"
-    return env
+    return drop_from_env(env)
 
 
 def normalize_flag_name(token: str) -> str | None:
@@ -325,6 +330,8 @@ def seed_grok_credentials(home: Path, base_env: dict[str, str]) -> None:
         return
     target = Path(home) / "auth.json"
     target.write_bytes(source.read_bytes())
+    lock_owner_only(target)
+    _remember_auth_file(target)
 
 
 def _credential_source(base_env: dict[str, str]) -> Path | None:
@@ -340,6 +347,56 @@ def _credential_source(base_env: dict[str, str]) -> Path | None:
         if path.is_file():
             return path
     return None
+
+
+def lock_owner_only(path: Path) -> None:
+    """Owner-only permissions. POSIX is ``0600``. Windows is an ACL for this user."""
+    if os.name == "nt":
+        _windows_owner_only(path)
+        return
+    os.chmod(path, 0o600)
+    mode = path.stat().st_mode & 0o777
+    if mode != 0o600:
+        raise PermissionFlagError(f"auth.json mode is {mode:o}, expected 600")
+
+
+def _windows_owner_only(path: Path) -> None:
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    if not user:
+        raise PermissionFlagError("cannot lock auth.json without the current user name")
+    import subprocess
+
+    completed = subprocess.run(
+        ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise PermissionFlagError("could not lock auth.json to the current user")
+
+
+def _remember_auth_file(path: Path) -> None:
+    from taskbench.redact import remember_json_secrets, remember_secret
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        try:
+            remember_secret(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return
+        return
+    remember_json_secrets(payload)
+
+
+def wipe_grok_credentials(data_dir: Path) -> None:
+    """Delete a copied ``auth.json``. Missing files are fine."""
+    auth = Path(data_dir) / "grok-home" / "auth.json"
+    try:
+        auth.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def prepare_grok_config_home(data_dir: Path) -> Path:

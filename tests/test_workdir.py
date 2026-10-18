@@ -22,7 +22,16 @@ from taskbench.workdir import (
     rejection_reason,
     validate_workdir,
 )
-from tests.support import TempApp, base_packet, command_write_marker, make_config, packet_status, run_until, write_packet
+from tests.support import (
+    TempApp,
+    base_packet,
+    command_write_marker,
+    login_session,
+    make_config,
+    packet_status,
+    run_until,
+    write_packet,
+)
 
 
 def _link_dir(link: Path, target: Path) -> bool:
@@ -205,7 +214,7 @@ class RegistryAndRunTests(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "bot-dir") == "needs-approval")
-        saved = parse_yaml((self.store.needs_approval / "bot-dir.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.needs_approval / "bot-dir.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["status"], "needs-approval")
         self.assertEqual(saved["workdir"], str(folder.resolve()))
         self.assertFalse(is_registered(self.root / "var", folder.resolve()))
@@ -219,7 +228,7 @@ class RegistryAndRunTests(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "ui-dir") == "needs-approval")
-        saved = parse_yaml((self.store.needs_approval / "ui-dir.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.needs_approval / "ui-dir.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["from"], "web-ui")
         self.assertEqual(saved["workdir"], str(folder.resolve()))
         self.assertFalse(is_registered(self.root / "var", folder.resolve()))
@@ -233,7 +242,7 @@ class RegistryAndRunTests(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "ui-dir") == "done")
-        saved = parse_yaml((self.store.outbox / "ui-dir.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "ui-dir.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["workdir"], str(folder.resolve()))
         self.assertTrue(is_registered(self.root / "var", folder.resolve()))
         prompt = (self.store.outbox / "ui-dir.prompt.md").read_text(encoding="utf-8")
@@ -243,7 +252,9 @@ class RegistryAndRunTests(TempApp):
         self.assertIn("ui-dir", handoff)
         self.assertFalse((self.root / "projects" / "demo-canvas" / ".taskbench" / "LAST_AGENT.md").exists())
         output = (self.store.outbox / "ui-dir.output.log").read_text(encoding="utf-8")
-        self.assertIn("WORKDIR-INSTRUCTIONS-TOKEN", output)
+        self.assertIn("tool: read", output)
+        self.assertIn("read instructions", output)
+        self.assertNotIn("WORKDIR-INSTRUCTIONS-TOKEN", output)
 
     def test_allow_list_runs_inside_the_workdir(self) -> None:
         folder = self._workdir()
@@ -278,7 +289,7 @@ class RegistryAndRunTests(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "scan-dir") == "blocked")
-        saved = parse_yaml((self.store.outbox / "scan-dir.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "scan-dir.json").read_text(encoding="utf-8"))
         reason = saved["result"]["blocked_reason"]
         self.assertTrue(reason.startswith("Needs you"))
         self.assertIn(".grok/config.toml", reason)
@@ -311,14 +322,11 @@ class WebUiTests(TempApp):
         conn.close()
         self.assertIn("name='workdir'", body)
         self.assertIn("recent-folders", body)
-        token = re.search(r"name='csrf' value='([^']+)'", body)
-        launch = re.search(r"name='launch' value='([^']+)'", body)
-        self.assertIsNotNone(token)
-        self.assertIsNotNone(launch)
-        cookie = page.getheader("Set-Cookie")
+        self.assertNotIn("name='csrf'", body)
+        token, cookie = login_session(port, self.app)
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         form = (
-            f"csrf={token.group(1)}&launch={launch.group(1)}&goal=Use+this+folder&project=demo-canvas"
+            f"csrf={token}&goal=Use+this+folder&project=demo-canvas"
             f"&runner=grok-build&permissions=plan&workdir={folder}"
         )
         conn.request(
@@ -326,7 +334,7 @@ class WebUiTests(TempApp):
             "/tasks",
             body=form,
             headers={
-                "Cookie": cookie.split(";", 1)[0],
+                "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": f"http://127.0.0.1:{port}",
             },
@@ -363,9 +371,7 @@ class WebUiTests(TempApp):
         conn.close()
         self.assertEqual(page.status, 200)
         self.assertNotIn(b"Browse folders", body)
-        token = re.search(br"name='csrf' value='([^']+)'", body)
-        self.assertIsNotNone(token)
-        cookie = page.getheader("Set-Cookie")
+        token, cookie = login_session(port, app)
         called = []
 
         def fail_if_called() -> str:
@@ -376,15 +382,13 @@ class WebUiTests(TempApp):
         server.pick_local_folder = fail_if_called
         self.addCleanup(lambda: setattr(server, "pick_local_folder", original))
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        launch = re.search(br"name='launch' value='([^']+)'", body)
-        self.assertIsNotNone(launch)
         conn.request(
             "POST",
             "/pick-folder",
-            body=f"csrf={token.group(1).decode()}&launch={launch.group(1).decode()}",
+            body=f"csrf={token}",
             headers={
                 "Host": host,
-                "Cookie": cookie.split(";", 1)[0],
+                "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": f"http://{host}",
             },

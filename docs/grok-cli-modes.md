@@ -61,6 +61,10 @@ in that field, the run fails. That is the check. taskbench does not treat
 `default` as success, and it does not write a project `.claude/settings.json`
 to force `defaultMode`.
 
+The real `grok` binary has to confirm this. The tests use a stub that prints
+the init line. A missing event, an empty `permissionMode`, or `default` is a
+failed run, not a successful one. Do not treat the stub as that confirmation.
+
 The OS sandbox behind `--sandbox strict` is Linux Landlock and macOS Seatbelt.
 The permissions guide's sandbox page is the boundary on those systems. Windows
 has no such sandbox; see `docs/grok-cli-home-and-auth.md`.

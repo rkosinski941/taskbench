@@ -21,15 +21,15 @@ from typing import Any
 from taskbench.adapters import get_adapter
 from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import Config
+from taskbench.launch import LaunchRefused, spawn_runner
 from taskbench.permissions import (
     needs_you_message,
     prefix_output,
-    prepare_grok_config_home,
     scan_project_permission_rules,
     scrub_environment,
-    seed_grok_credentials,
     unexpected_permission,
     windows_sandbox_banner,
+    wipe_grok_credentials,
 )
 from taskbench.process_tree import (
     ManagedProcess,
@@ -51,6 +51,7 @@ from taskbench.projects import (
 )
 from taskbench.workdir import (
     WorkdirError,
+    WorkdirLease,
     WorkdirTrustError,
     is_registered,
     same_canonical,
@@ -66,7 +67,7 @@ from taskbench.safety import (
     shell_argv,
 )
 from taskbench.state import StateStore
-from taskbench.task_format import emit_yaml, load_packet_text
+from taskbench.task_format import load_packet_text
 
 RETRO_TIMEOUT_S = 30
 
@@ -82,6 +83,8 @@ class Watcher:
         self.deadline: float | None = None
         self._stop = False
         self._recovered = False
+        self._lease: WorkdirLease | None = None
+        wipe_grok_credentials(config.data_dir)
 
     def shutdown(self) -> None:
         """Kill the live tree. The web server does not call this when a browser disconnects."""
@@ -93,6 +96,8 @@ class Watcher:
             elif self.proc is not None:
                 self.proc.kill_tree()
                 self.proc = None
+            self._close_lease()
+            wipe_grok_credentials(self.config.data_dir)
 
     def request_cancel(self, packet_id: str) -> None:
         with self.store.lock:
@@ -270,17 +275,7 @@ class Watcher:
         timeout_s = int(packet.get("timeout_s") or 900)
         try:
             folder = self._confirm_launch_folder(folder)
-            argv = adapter.build_command(
-                prompt_file=self.store.outbox / f"{packet_id}.prompt.md",
-                project_dir=folder,
-                timeout_s=timeout_s,
-            )
-            config_home = None
-            if os.name == "nt" and adapter.name == "grok-build":
-                config_home = prepare_grok_config_home(self.config.data_dir)
-                seed_grok_credentials(config_home, os.environ.copy())
-            env = adapter.environment(os.environ.copy(), config_home=config_home)
-        except (NotImplementedError, ValueError) as exc:
+        except (NotImplementedError, ValueError, WorkdirError) as exc:
             self._publish_blocked(packet, str(exc))
             return "blocked"
         packet["status"] = "running"
@@ -300,8 +295,32 @@ class Watcher:
             "pending": None,
             "cmdline_checked": False,
         }
+        self._lease = WorkdirLease(folder)
         try:
-            self.proc = ManagedProcess(argv, folder, env)
+            self._lease.acquire()
+        except OSError as exc:
+            self._close_lease()
+            self._publish_blocked(packet, f"could not hold workdir: {exc}")
+            return "blocked"
+        try:
+            self.proc, _home = spawn_runner(
+                adapter=adapter,
+                folder=folder,
+                prompt_file=self.store.runtime / f"{packet_id}.prompt.md",
+                timeout_s=timeout_s,
+                base_env=os.environ.copy(),
+                config=self.config,
+            )
+        except LaunchRefused as exc:
+            self.proc = None
+            self.deadline = None
+            self._close_lease()
+            wipe_grok_credentials(self.config.data_dir)
+            reason = str(exc)
+            if reason.startswith("Needs you") or reason == "workdir changed before launch":
+                self._publish_blocked(packet, reason)
+                return "blocked"
+            return self._kill_and_finish(packet, "failed", reason, killed=True)
         except (ProcessTreeError, OSError) as exc:
             self.proc = None
             self.deadline = None
@@ -366,8 +385,9 @@ class Watcher:
             if item is None:
                 break
             stream, line = item
-            self.store.append_output(packet_id, line if stream == "stdout" else f"[stderr] {line}")
+            self.store.append_raw(packet_id, line if stream == "stdout" else f"[stderr] {line}")
             if stream != "stdout":
+                self.store.append_output(packet_id, line)
                 continue
             try:
                 event = self.adapter.parse_line(line) if self.adapter else None
@@ -375,6 +395,10 @@ class Watcher:
                 return self._kill_and_finish(packet, "failed", str(exc), killed=True)
             if event is None:
                 self.run_state["texts"].append(line.rstrip("\n"))
+                if not line.lstrip().startswith("{") and not line.lstrip().startswith("TASKBENCH"):
+                    self.store.append_output(packet_id, line)
+                continue
+            if event.get("type") == "ignore":
                 continue
             outcome = self._handle_event(packet, event)
             if outcome == "pause":
@@ -417,33 +441,9 @@ class Watcher:
 
     def _handle_event(self, packet: dict[str, Any], event: dict[str, Any]) -> str:
         if not self.run_state.get("init_ok"):
-            if not event.get("init"):
-                self._kill_and_finish(
-                    packet,
-                    "failed",
-                    "missing permissionMode init event",
-                    killed=True,
-                )
-                return "terminal"
-            mode = event.get("permissionMode", event.get("permission_mode", event.get("mode")))
-            if mode is None or not str(mode).strip():
-                self._kill_and_finish(
-                    packet,
-                    "failed",
-                    "missing permissionMode on the streaming-messages init event",
-                    killed=True,
-                )
-                return "terminal"
-            folded = str(mode).strip().lower().replace("-", "").replace("_", "")
-            if folded != "dontask":
-                self._kill_and_finish(
-                    packet,
-                    "failed",
-                    "unexpected permission mode: "
-                    f"{mode} (expected dontAsk from the streaming-messages init event); "
-                    "refusing to continue",
-                    killed=True,
-                )
+            reason = init_failure(event)
+            if reason:
+                self._kill_and_finish(packet, "failed", reason, killed=True)
                 return "terminal"
             self.run_state["init_ok"] = True
             return "continue"
@@ -464,11 +464,16 @@ class Watcher:
             text = event.get("text")
             if isinstance(text, str):
                 self.run_state["texts"].append(text)
+                self.store.append_output(str(packet["id"]), text if text.endswith("\n") else text + "\n")
             return "continue"
         if kind == "result":
             summary = event.get("summary")
             if isinstance(summary, str):
                 self.run_state["summary"] = summary
+                self.store.append_output(
+                    str(packet["id"]),
+                    summary if summary.endswith("\n") else summary + "\n",
+                )
             artifacts = event.get("artifacts")
             if isinstance(artifacts, list):
                 self.run_state["artifacts"] = [item for item in artifacts if isinstance(item, str)]
@@ -500,7 +505,9 @@ class Watcher:
             allow=list(packet.get("allow") or []),
             sandbox_only=sandbox_only,
             project_dir=folder,
+            denied_dirs=[self.config.data_dir / "grok-home"],
         )
+        self.store.append_output(str(packet["id"]), f"tool: {action.get('op') or 'tool'}\n")
         command = full_command(action)
         if decision.kind == "allow":
             self.store.log(f"{packet['id']} allow-match {command}")
@@ -571,11 +578,11 @@ class Watcher:
         try:
             if op in {"list", "read", "diff"}:
                 result = execute_readonly(folder, action)
-                self.store.append_output(packet_id, result + ("\n" if result and not result.endswith("\n") else ""))
+                self.store.append_raw(packet_id, result + ("\n" if result and not result.endswith("\n") else ""))
                 return
             if op == "write":
                 result = execute_write(folder, action)
-                self.store.append_output(packet_id, result + "\n")
+                self.store.append_raw(packet_id, result + "\n")
                 return
         except Exception as exc:  # path escapes are refusals, not crashes
             self.store.append_output(packet_id, f"action error: {exc}\n")
@@ -699,7 +706,10 @@ class Watcher:
         if not summary:
             self.run_state["summary"] = texts[-1][:500]
         if self.run_state.get("retro") is None:
-            self._retro_followup(packet)
+            try:
+                self._retro_followup(packet)
+            except LaunchRefused as exc:
+                return self._kill_and_finish(packet, "failed", str(exc), killed=True)
         return self._kill_and_finish(packet, "done", None, killed=False)
 
     def _retro_followup(self, packet: dict[str, Any]) -> None:
@@ -712,37 +722,50 @@ class Watcher:
 
         atomic_write_text(path, prompt)
         try:
-            argv = self.adapter.build_command(
+            proc, _home = spawn_runner(
+                adapter=self.adapter,
+                folder=folder,
                 prompt_file=path,
-                project_dir=folder,
                 timeout_s=RETRO_TIMEOUT_S,
+                base_env=os.environ.copy(),
+                config=self.config,
             )
-            env = self.adapter.environment(os.environ.copy())
-            proc = ManagedProcess(argv, folder, env)
-        except Exception:
-            return
+        except LaunchRefused:
+            raise
+        except (ProcessTreeError, OSError) as exc:
+            raise LaunchRefused(f"refusing to run without process confinement: {exc}") from exc
         deadline = time.monotonic() + min(RETRO_TIMEOUT_S, max(self._remaining(), 1))
+        init_ok = False
         try:
             while time.monotonic() < deadline:
                 item = proc.poll_line()
                 if item is not None:
                     stream, line = item
+                    self.store.append_raw(str(packet["id"]), line if stream == "stdout" else f"[stderr] {line}")
                     if stream == "stdout":
                         try:
                             event = self.adapter.parse_line(line)
                         except ProtocolError:
                             event = None
-                        if event and event.get("type") == "retro":
-                            retro = _normalize_retro(event)
-                            if retro is not None:
-                                self.run_state["retro"] = retro
-                            break
+                        if event and event.get("type") != "ignore":
+                            if not init_ok:
+                                reason = init_failure(event)
+                                if reason:
+                                    raise LaunchRefused(reason)
+                                init_ok = True
+                            elif event.get("type") == "retro":
+                                retro = _normalize_retro(event)
+                                if retro is not None:
+                                    self.run_state["retro"] = retro
+                                break
                 if proc.exit_code() is not None and not proc.output_closed():
                     proc.reap_group()
                 if proc.exit_code() is not None and proc.output_closed():
                     break
                 if item is None:
                     time.sleep(0.02)
+            if not init_ok:
+                raise LaunchRefused("missing permissionMode init event")
         finally:
             proc.kill_tree()
 
@@ -810,6 +833,8 @@ class Watcher:
         self.run_state = {}
         self.deadline = None
         self.adapter = None
+        self._close_lease()
+        wipe_grok_credentials(self.config.data_dir)
         return status
 
     def _finish_without_process(
@@ -836,6 +861,8 @@ class Watcher:
         self._publish(packet, output)
         self.store.log(f"{packet['id']} -> {status} ({reason})")
         self._write_handoff(packet, reason)
+        self._close_lease()
+        wipe_grok_credentials(self.config.data_dir)
 
     def _service_detached_approval(self, packet: dict[str, Any]) -> str:
         packet_id = str(packet["id"])
@@ -1086,15 +1113,21 @@ class Watcher:
         ports = listening_ports(set(self.run_state["pids"]))
         self.run_state.setdefault("ports_seen", set()).update(ports)
 
+    def _close_lease(self) -> None:
+        lease = self._lease
+        self._lease = None
+        if lease is not None:
+            lease.close()
+
     def _packet_in(self, location: str) -> dict[str, Any] | None:
-        from taskbench.task_format import parse_yaml
+        from taskbench.task_format import parse_stored
 
         directory = self.store.location_dir(location)
-        files = sorted(directory.glob("*.yaml"))
+        files = self.store.packet_paths(directory)
         if not files:
             return None
         try:
-            raw = parse_yaml(files[0].read_text(encoding="utf-8"))
+            raw = parse_stored(files[0].read_text(encoding="utf-8"))
         except Exception:
             return None
         if not isinstance(raw, dict):
@@ -1106,10 +1139,10 @@ class Watcher:
 
     def _next_claimed(self) -> dict[str, Any] | None:
         items: list[dict[str, Any]] = []
-        for path in sorted(self.store.claimed.glob("*.yaml")):
-            from taskbench.task_format import parse_yaml
+        for path in self.store.packet_paths(self.store.claimed):
+            from taskbench.task_format import parse_stored
 
-            raw = parse_yaml(path.read_text(encoding="utf-8"))
+            raw = parse_stored(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 items.append(raw)
         if not items:
@@ -1171,6 +1204,27 @@ def _normalize_retro(event: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def init_failure(event: dict[str, Any]) -> str | None:
+    """Why this event is not a ``dontAsk`` init, or None when it is.
+
+    ``default`` is not success. A missing field fails closed. The real
+    ``grok`` binary has to emit this event; the test stub is not that check.
+    """
+    if not event.get("init"):
+        return "missing permissionMode init event"
+    mode = event.get("permissionMode", event.get("permission_mode", event.get("mode")))
+    if mode is None or not str(mode).strip():
+        return "missing permissionMode on the streaming-messages init event"
+    folded = str(mode).strip().lower().replace("-", "").replace("_", "")
+    if folded != "dontask":
+        return (
+            "unexpected permission mode: "
+            f"{mode} (expected dontAsk from the streaming-messages init event); "
+            "refusing to continue"
+        )
+    return None
+
+
 def _last_lines(text: str, count: int) -> str:
     lines = [line for line in text.splitlines() if line.strip()]
     return " | ".join(lines[-count:])
@@ -1190,13 +1244,13 @@ def _loopback_command(command: str) -> bool:
 
 def queue_view(store: StateStore) -> list[dict[str, Any]]:
     """Claimed tasks with position (running counts as position 1) and wait seconds."""
-    running = list(store.running.glob("*.yaml")) + list(store.needs_approval.glob("*.yaml"))
+    running = store.packet_paths(store.running) + store.packet_paths(store.needs_approval)
     ahead = 1 if running else 0
     claimed: list[dict[str, Any]] = []
-    from taskbench.task_format import parse_yaml
+    from taskbench.task_format import parse_stored
 
-    for path in store.claimed.glob("*.yaml"):
-        raw = parse_yaml(path.read_text(encoding="utf-8"))
+    for path in store.packet_paths(store.claimed):
+        raw = parse_stored(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             claimed.append(raw)
     claimed.sort(key=lambda packet: str(packet.get("claimed_at") or ""))

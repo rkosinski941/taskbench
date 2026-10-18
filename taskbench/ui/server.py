@@ -41,6 +41,7 @@ from taskbench.workdir import (
 )
 
 COOKIE = "taskbench_csrf"
+SESSION_COOKIE = "taskbench_session"
 MAX_BODY = 2_000_000
 
 
@@ -127,8 +128,22 @@ class App:
         self.config = config
         self.store = StateStore(config.data_dir)
         self.watcher = Watcher(config, self.store)
-        # Per-launch secret. Memory only. Not written to disk or the repo.
-        self.launch_token = secrets.token_urlsafe(32)
+        # One-time login token, session secret, and CSRF token. Memory only.
+        # They are never written to disk, the run log, or a child environment.
+        self.login_token = secrets.token_urlsafe(32)
+        self.login_consumed = False
+        self.session_secret = secrets.token_urlsafe(32)
+        self.csrf_token = secrets.token_urlsafe(32)
+        from taskbench.redact import remember_secret
+
+        remember_secret(self.login_token)
+        remember_secret(self.session_secret)
+        remember_secret(self.csrf_token)
+
+
+def login_url(app: App, port: int) -> str:
+    """One-time console URL. Printing this is the caller's job, not the log."""
+    return f"http://127.0.0.1:{port}/login?token={app.login_token}"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -141,24 +156,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if not self._check_host():
             return
-        token, fresh = self._session_token()
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/login":
+            self._login(parse_qs(parsed.query))
+            return
         if path == "/":
             query = parse_qs(parsed.query)
             prefill = (query.get("workdir") or [""])[-1]
+            csrf = self._csrf_for_page()
             body = render_index(
                 self.server.app,
-                token,
+                csrf,
                 self._tailscale_user(),
                 prefill_workdir=prefill,
                 local_picker=_loopback_host(self.headers.get("Host")),
             ).encode("utf-8")
-            self._send(200, "text/html; charset=utf-8", body, token if fresh else None)
+            self._send(200, "text/html; charset=utf-8", body, None)
             return
         if path.startswith("/task/"):
             packet_id = path[len("/task/") :]
-            self._task_page(packet_id, token, fresh)
+            self._task_page(packet_id)
             return
         if path.startswith("/outbox/"):
             self._outbox_file(path[len("/outbox/") :])
@@ -177,18 +195,15 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0 or length > MAX_BODY:
             self._send(413, "text/plain; charset=utf-8", b"body too large", None)
             return
+        if not self._check_fetch_site():
+            return
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         form = {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
-        token, _fresh = self._session_token()
-        cookie = _cookie(self.headers.get("Cookie"), COOKIE)
-        supplied = form.get("csrf", "")
-        if not _same_secret(cookie, supplied):
-            self._send(403, "text/plain; charset=utf-8", b"CSRF check failed", None)
+        if not self._session_ok():
+            self._send(403, "text/plain; charset=utf-8", b"session check failed", None)
             return
-        launch = form.get("launch", "")
-        expected = self.server.app.launch_token
-        if not _same_secret(launch, expected):
-            self._send(403, "text/plain; charset=utf-8", b"launch token check failed", None)
+        if not _same_secret(form.get("csrf"), self.server.app.csrf_token):
+            self._send(403, "text/plain; charset=utf-8", b"CSRF check failed", None)
             return
         parsed = urlparse(self.path)
         path = parsed.path
@@ -196,16 +211,22 @@ class Handler(BaseHTTPRequestHandler):
             self._create_task(form)
             return
         if path == "/register-workdir":
+            if not self._local_approval_ok():
+                return
             self._register_workdir(form)
             return
         if path == "/pick-folder":
             self._pick_folder()
             return
         if path.startswith("/task/") and path.endswith("/approve"):
+            if not self._local_approval_ok():
+                return
             packet_id = path[len("/task/") : -len("/approve")].strip("/")
             self._decide(packet_id, "approved")
             return
         if path.startswith("/task/") and path.endswith("/deny"):
+            if not self._local_approval_ok():
+                return
             packet_id = path[len("/task/") : -len("/deny")].strip("/")
             self._decide(packet_id, "denied")
             return
@@ -313,7 +334,66 @@ class Handler(BaseHTTPRequestHandler):
         self.server.app.watcher.request_decision(packet_id, decision)
         self._redirect()
 
-    def _task_page(self, packet_id: str, token: str, fresh: bool) -> None:
+    def _login(self, query: dict[str, list[str]]) -> None:
+        supplied = (query.get("token") or [""])[-1]
+        app = self.server.app
+        if app.login_consumed or not _same_secret(supplied, app.login_token):
+            self._send(403, "text/plain; charset=utf-8", b"login token check failed", None)
+            return
+        app.login_consumed = True
+        body = b"See other"
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE}={app.session_secret}; HttpOnly; SameSite=Strict; Path=/",
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _session_ok(self) -> bool:
+        cookie = _cookie(self.headers.get("Cookie"), SESSION_COOKIE)
+        return _same_secret(cookie, self.server.app.session_secret)
+
+    def _csrf_for_page(self) -> str:
+        if not self._session_ok():
+            return ""
+        return self.server.app.csrf_token
+
+    def _check_fetch_site(self) -> bool:
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is None or site.strip() == "":
+            return True
+        if site.strip().casefold() in {"same-origin", "none"}:
+            return True
+        self._send(403, "text/plain; charset=utf-8", b"rejected fetch site", None)
+        return False
+
+    def _remote_arrival(self) -> bool:
+        if (self.headers.get("Tailscale-User-Login") or "").strip():
+            return True
+        host = (self.headers.get("Host") or "").strip()
+        if host.startswith("["):
+            name = host.split("]")[0].strip("[")
+        elif host.count(":") == 1:
+            name = host.split(":", 1)[0]
+        else:
+            name = host
+        allowed = {item.strip().casefold() for item in self.server.app.config.allowed_hosts if item.strip()}
+        return bool(name) and name.casefold() in allowed
+
+    def _local_approval_ok(self) -> bool:
+        if not self._remote_arrival():
+            return True
+        if self.server.app.config.remote_approvals is True:
+            return True
+        self._send(403, "text/plain; charset=utf-8", b"remote approvals are disabled", None)
+        return False
+
+    def _task_page(self, packet_id: str) -> None:
         if not _safe_id(packet_id):
             self._send(404, "text/html; charset=utf-8", _not_found(), None)
             return
@@ -322,8 +402,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/html; charset=utf-8", _not_found(), None)
             return
         _location, packet = found
-        body = render_task(self.server.app, packet, token, self._tailscale_user()).encode("utf-8")
-        self._send(200, "text/html; charset=utf-8", body, token if fresh else None)
+        body = render_task(self.server.app, packet, self._csrf_for_page(), self._tailscale_user()).encode("utf-8")
+        self._send(200, "text/html; charset=utf-8", body, None)
 
     def _outbox_file(self, name: str) -> None:
         packet_id, suffix = _split_outbox_name(name)
@@ -389,12 +469,6 @@ class Handler(BaseHTTPRequestHandler):
         if not text or len(text) > 200:
             return None
         return text
-
-    def _session_token(self) -> tuple[str, bool]:
-        existing = _cookie(self.headers.get("Cookie"), COOKIE)
-        if existing and len(existing) >= 16:
-            return existing, False
-        return secrets.token_urlsafe(32), True
 
     def _redirect(self, location: str = "/") -> None:
         if not location.startswith("/") or location.startswith("//"):
@@ -473,8 +547,14 @@ def _composer(app: App, token: str, *, prefill_workdir: str = "", local_picker: 
     runner_options = "".join(
         f"<option value='{html.escape(name)}'>{html.escape(name)}</option>" for name in runners
     )
+    notice = ""
+    if not token:
+        notice = (
+            "<p class='login-note'>Open the one-time URL printed in the console at startup.</p>"
+        )
     return (
-        "<form method='post' action='/tasks'>"
+        notice
+        + "<form method='post' action='/tasks'>"
         + _hidden_tokens(app, token)
         + "<p>New task as <strong data-human-label='web-ui'>web-ui</strong></p>"
         f"<label>Project <select name='project'>{project_options}</select></label> "
@@ -574,7 +654,7 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
             )
     parts.append("<ul class='files'>")
     for suffix, label in (
-        (".yaml", "packet"),
+        (".json", "packet"),
         (".prompt.md", "prompt"),
         (".output.log", "output"),
     ):
@@ -665,10 +745,9 @@ def _folder_field(app: App, prefill: str) -> str:
 
 
 def _hidden_tokens(app: App, token: str) -> str:
-    return (
-        f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
-        f"<input type='hidden' name='launch' value='{html.escape(app.launch_token)}'>"
-    )
+    if not token:
+        return ""
+    return f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
 
 
 def _picker_form(app: App, local_picker: bool, token: str) -> str:
@@ -805,7 +884,7 @@ def _safe_id(packet_id: str) -> bool:
 
 
 def _split_outbox_name(name: str) -> tuple[str | None, str | None]:
-    for suffix in (".prompt.md", ".output.log", ".yaml"):
+    for suffix in (".prompt.md", ".output.log", ".json", ".yaml"):
         if name.endswith(suffix):
             packet_id = name[: -len(suffix)]
             if _safe_id(packet_id):

@@ -81,7 +81,12 @@ def _watch(app: App) -> None:
 
 def _serve(app: App) -> None:
     server = serve(app)
-    print(f"taskbench {app.config.bind_host}:{server.server_address[1]}", flush=True)
+    port = int(server.server_address[1])
+    # stdout only. The one-time token is not written to the run log.
+    from taskbench.ui.server import login_url
+
+    print(login_url(app, port), flush=True)
+    print(f"taskbench {app.config.bind_host}:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

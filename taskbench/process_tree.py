@@ -163,6 +163,14 @@ def kill_process_group(pgid: int) -> None:
         return
 
 
+def _require_runner_guard(argv: list[str]) -> None:
+    """Runner processes may start only from ``spawn_runner``."""
+    from taskbench.launch import argv_is_runner, runner_guard_active
+
+    if argv_is_runner(argv) and not runner_guard_active():
+        raise ProcessTreeError("refusing to spawn the runner outside the guarded launch")
+
+
 class ManagedProcess:
     """A child plus the group or job that contains its descendants.
 
@@ -175,6 +183,7 @@ class ManagedProcess:
     def __init__(self, argv: list[str], cwd: Path, env: dict[str, str]) -> None:
         if not argv:
             raise ProcessTreeError("empty argv")
+        _require_runner_guard(argv)
         if type(self).force_confinement_failure:
             raise ProcessTreeError(
                 "simulated job or process-group assignment failure"

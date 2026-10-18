@@ -30,7 +30,15 @@ from taskbench.workdir import (
     validate_workdir,
     windows_canonical_path,
 )
-from tests.support import ROOT, TempApp, base_packet, packet_status, run_until, write_packet
+from tests.support import (
+    ROOT,
+    TempApp,
+    base_packet,
+    login_session,
+    packet_status,
+    run_until,
+    write_packet,
+)
 
 
 class ProvenanceTests(TempApp):
@@ -61,7 +69,7 @@ class ProvenanceTests(TempApp):
             packet["workdir"] = str(folder)
             write_packet(self.store.inbox, packet)
             run_until(watcher, lambda packet_id=packet_id: packet_status(self.store, packet_id) == "needs-approval")
-            saved = parse_yaml((self.store.needs_approval / f"{packet_id}.yaml").read_text(encoding="utf-8"))
+            saved = parse_yaml((self.store.needs_approval / f"{packet_id}.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["status"], "needs-approval")
             self.assertEqual(saved["workdir"], str(folder.resolve()))
             self.assertFalse(is_registered(self.root / "var", folder.resolve()))
@@ -90,15 +98,14 @@ class ProvenanceTests(TempApp):
         self.assertEqual(packet_status(self.store, "prov-wait"), "needs-approval")
         self.assertFalse(is_registered(self.root / "var", folder.resolve()))
         port = self._serve()
-        body, cookie = self._page(port, "/task/prov-wait")
-        csrf = re.search(r"name='csrf' value='([^']+)'", body).group(1)
-        launch = re.search(r"name='launch' value='([^']+)'", body).group(1)
-        self.assertNotIn(launch, (self.root / "var" / "workdir-registry.json").read_text(encoding="utf-8") if (self.root / "var" / "workdir-registry.json").is_file() else "")
+        body, _cookie = self._page(port, "/task/prov-wait")
+        self.assertNotIn("name='csrf'", body)
+        csrf, cookie = login_session(port, app)
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request(
             "POST",
             "/register-workdir",
-            body=f"csrf={csrf}&launch={launch}&path={quote(str(folder.resolve()))}",
+            body=f"csrf={csrf}&path={quote(str(folder.resolve()))}",
             headers={
                 "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -114,25 +121,27 @@ class ProvenanceTests(TempApp):
         run_until(watcher, lambda: packet_status(self.store, "prov-wait") == "done")
 
     def test_launch_token_and_origin_are_required(self) -> None:
-        self.make()
+        _config, app, _watcher = self.make()
         port = self._serve()
-        body, cookie = self._page(port)
-        csrf = re.search(r"name='csrf' value='([^']+)'", body).group(1)
-        launch = re.search(r"name='launch' value='([^']+)'", body).group(1)
+        body, _cookie = self._page(port)
+        self.assertNotIn("name='csrf'", body)
+        self.assertNotIn(app.login_token, body)
+        self.assertIn("one-time URL", body)
+        csrf, cookie = login_session(port, app)
         cases = (
-            (f"csrf={csrf}", {"Origin": f"http://127.0.0.1:{port}"}, 403, b"launch token"),
-            (f"csrf={csrf}&launch={launch}", {}, 403, b"origin"),
+            (f"csrf={csrf}", {"Origin": f"http://127.0.0.1:{port}", "Cookie": ""}, 403, b"session"),
+            (f"csrf={csrf}", {}, 403, b"origin"),
             (
-                f"csrf={csrf}&launch={launch}",
+                f"csrf={csrf}",
                 {"Origin": "http://evil.example"},
                 403,
                 b"origin",
             ),
             (
-                f"csrf={csrf}&launch=short",
+                "csrf=short",
                 {"Origin": f"http://127.0.0.1:{port}"},
                 403,
-                b"launch token",
+                b"CSRF",
             ),
         )
         for form, extra, status, needle in cases:
@@ -224,9 +233,12 @@ class WorkdirDenialTests(unittest.TestCase):
         secret = root / "has-ssh"
         secret.mkdir()
         (secret / ".ssh").mkdir()
-        with self.assertRaises(WorkdirError) as caught:
-            validate_workdir(str(secret))
-        self.assertIn("contains a denied path", str(caught.exception))
+        nested = root / "node_modules" / "x" / ".bin"
+        nested.mkdir(parents=True)
+        (root / "app" / ".vscode").mkdir(parents=True)
+        self.assertTrue(validate_workdir(str(secret)).is_dir())
+        self.assertTrue(validate_workdir(str(nested.parent)).is_dir())
+        self.assertTrue(validate_workdir(str(root / "app")).is_dir())
         settings = root / "has-grok"
         settings.mkdir()
         (settings / ".grok").mkdir()
@@ -270,7 +282,7 @@ class ToctouTests(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "toctou-1") == "blocked")
-        saved = parse_yaml((self.store.outbox / "toctou-1.yaml").read_text(encoding="utf-8"))
+        saved = parse_yaml((self.store.outbox / "toctou-1.json").read_text(encoding="utf-8"))
         self.assertIn("workdir changed before launch", saved["result"]["blocked_reason"])
         self.assertIsNone(watcher.proc)
 
@@ -377,19 +389,19 @@ class ModeInitTests(TempApp):
         _config, _app, watcher = self.make(scenario="init-no-mode", can_ask=False)
         write_packet(self.store.inbox, base_packet(id="init-none", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "init-none") == "failed")
-        missing = parse_yaml((self.store.outbox / "init-none.yaml").read_text(encoding="utf-8"))
+        missing = parse_yaml((self.store.outbox / "init-none.json").read_text(encoding="utf-8"))
         self.assertIn("missing permissionMode", missing["result"]["blocked_reason"])
 
         _config, _app, watcher = self.make(scenario="text-before-init", can_ask=False)
         write_packet(self.store.inbox, base_packet(id="init-late", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "init-late") == "failed")
-        late = parse_yaml((self.store.outbox / "init-late.yaml").read_text(encoding="utf-8"))
+        late = parse_yaml((self.store.outbox / "init-late.json").read_text(encoding="utf-8"))
         self.assertIn("missing permissionMode init event", late["result"]["blocked_reason"])
 
         _config, _app, watcher = self.make(scenario="bad-permission", can_ask=False)
         write_packet(self.store.inbox, base_packet(id="init-bad", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "init-bad") == "failed")
-        bad = parse_yaml((self.store.outbox / "init-bad.yaml").read_text(encoding="utf-8"))
+        bad = parse_yaml((self.store.outbox / "init-bad.json").read_text(encoding="utf-8"))
         self.assertIn("unexpected permission mode", bad["result"]["blocked_reason"])
         self.assertIn("always-approve", bad["result"]["blocked_reason"])
 
@@ -422,7 +434,7 @@ class CredentialSeedTests(unittest.TestCase):
             "GROK_HOME": str(grok),
         }
         scrubbed = scrub_environment(parent)
-        self.assertEqual(scrubbed["XAI_API_KEY"], "xai-test-key")
+        self.assertNotIn("XAI_API_KEY", scrubbed)
         self.assertNotIn("GROK_HOME", scrubbed)
         pinned = prepare_grok_config_home(root / "with-key")
         seed_grok_credentials(pinned, parent)
@@ -431,6 +443,8 @@ class CredentialSeedTests(unittest.TestCase):
         home = prepare_grok_config_home(root / "with-file")
         seed_grok_credentials(home, no_key)
         self.assertEqual((home / "auth.json").read_text(encoding="utf-8"), '{"token":"sekrit-token"}\n')
+        if os.name != "nt":
+            self.assertEqual((home / "auth.json").stat().st_mode & 0o777, 0o600)
         self.assertFalse((home / "config.toml").exists())
         names = {path.name for path in home.iterdir()}
         self.assertEqual(names, {"auth.json"})

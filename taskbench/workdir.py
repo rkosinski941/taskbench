@@ -12,13 +12,20 @@ data directory (``workdir-registry.json``). It is not written into the
 project repo. Nothing in a packet, including ``from: web-ui``, can add a
 folder. Only the local UI's register endpoint can.
 
-A chosen folder may contain ``.grok`` and ``.claude`` (the allow-rule scan
-reports those), plus ``.git``, ``.github``, and ``.taskbench``. Any other
-hidden directory under it is rejected. The folder may not be the profile,
-a personal folder (Documents, Desktop, Downloads, OneDrive), anything
-inside AppData or a dot-folder under the profile, or the taskbench
-install, config, or state directory. A folder that is an ancestor of one
-of those is rejected too.
+A chosen folder may contain hidden directories such as ``.vscode`` or
+``node_modules/x/.bin``. Dot-folders are denied only when they sit directly
+under the profile (``.ssh``, ``.grok``, ``.aws``, and any other ``.*``
+there), not at an arbitrary depth inside a project. The folder may not be
+the profile, a personal folder (Documents, Desktop, Downloads, OneDrive),
+anything inside AppData, or the taskbench install, config, or state
+directory. A folder that is an ancestor of one of those is rejected too.
+Admin shares (``C$``, ``ADMIN$``, ``IPC$``) and ``\\\\localhost\\C$\\...``
+are rejected before they are resolved.
+
+On Windows a run holds an open directory handle without
+``FILE_SHARE_DELETE`` so the folder cannot be replaced while the run is
+live. On POSIX, opening the directory does not stop a parent rename. That
+residual swap window is documented on ``WorkdirLease``.
 """
 
 from __future__ import annotations
@@ -101,6 +108,9 @@ def validate_workdir(
     text = raw.strip()
     if not _is_absolute(text, os.name):
         raise WorkdirError("workdir must be an absolute path")
+    unc = _unc_rejection(text)
+    if unc:
+        raise WorkdirError(unc)
     try:
         resolved = os.path.realpath(text, strict=True)
     except FileNotFoundError as exc:
@@ -119,8 +129,6 @@ def validate_workdir(
     reason = rejection_reason(resolved, protected_roots=protected)
     if reason:
         raise WorkdirError(reason, resolved)
-    if _contains_denied_dir(Path(resolved)):
-        raise WorkdirError("workdir contains a denied path", resolved)
     return Path(resolved)
 
 
@@ -145,6 +153,9 @@ def rejection_reason(
     symlink or junction. Comparison is case-insensitive on Windows and macOS.
     """
     plat = platform or ("nt" if os.name == "nt" else ("darwin" if sys.platform == "darwin" else "posix"))
+    unc = _unc_rejection(resolved)
+    if unc:
+        return unc
     if _is_drive_root(resolved, plat):
         return "workdir is a drive root"
     profiles = profile_roots if profile_roots is not None else _profile_roots()
@@ -339,11 +350,47 @@ def _inside_appdata(path: str, profile: str, platform: str) -> bool:
 
 
 def _inside_dot_folder(path: str, profile: str, platform: str) -> bool:
+    """Dot-folders count only as a direct child of the profile.
+
+    ``~/.ssh`` and ``~/.ssh/keys`` are rejected. ``~/src/app/.vscode`` and
+    ``~/proj/node_modules/x/.bin`` are not, because the first component
+    under the profile is an ordinary directory.
+    """
     if _same(path, profile, platform) or not _under(path, profile, platform):
         return False
     rest = _fold(path, platform)[len(_fold(profile, platform)) :].strip("\\/")
+    if not rest:
+        return False
     sep = "\\" if platform == "nt" else "/"
-    return any(part.startswith(".") and part not in {".", ".."} for part in rest.split(sep))
+    first = rest.split(sep)[0]
+    return first.startswith(".") and first not in {".", ".."}
+
+
+_ADMIN_SHARES = frozenset({"admin$", "ipc$", "print$"})
+
+
+def _unc_rejection(text: str) -> str | None:
+    """Reject admin shares and localhost UNC paths that name a local drive.
+
+    This is a string check so it runs on every platform, before ``realpath``.
+    A UNC path that later canonicalizes into a system directory is also
+    rejected by the system-folder rule.
+    """
+    raw = text.replace("/", "\\")
+    if not raw.startswith("\\\\"):
+        return None
+    parts = [part for part in raw.split("\\") if part]
+    if len(parts) < 2:
+        return None
+    host, share = parts[0], parts[1]
+    share_fold = share.casefold()
+    if share_fold in _ADMIN_SHARES or re.fullmatch(r"[a-z]\$", share_fold):
+        return "workdir is an admin share"
+    if host.casefold() in {"localhost", "127.0.0.1", "."} and (
+        share_fold.endswith("$") or share_fold in {"windows", "system32"}
+    ):
+        return "workdir is an admin share"
+    return None
 
 
 def _join(root: str, name: str, platform: str) -> str:
@@ -378,43 +425,91 @@ def _protected_roots(*, state_dir: Path | str | None, config_dir: Path | str | N
     return roots
 
 
-# Project settings are scanned (Needs you) instead of rejected here.
-# ``.git`` is source control. ``.github`` is workflow metadata.
-# ``.taskbench`` is the watcher's own log directory, created after launch.
-_ALLOWED_DOT_DIRS = {".git", ".github", ".taskbench", ".grok", ".claude"}
+class WorkdirLease:
+    """Hold the workdir open for the whole run, including the retro follow-up.
 
+    On Windows the directory is opened with ``GENERIC_READ`` and
+    ``FILE_SHARE_READ | FILE_SHARE_WRITE`` only. ``FILE_SHARE_DELETE`` is
+    not granted, so another process cannot delete or replace the directory
+    while this handle is open.
 
-def _contains_denied_dir(folder: Path) -> bool:
-    """True when ``folder`` contains a hidden directory other than the allowed set.
-
-    Profile credential directories (``.ssh``, ``.aws``, and any other ``.*``)
-    make the folder an ancestor of a denied path. ``.grok`` and ``.claude``
-    stay allowed so the settings scan can send the task to Needs you.
-    An unreadable child fails closed.
+    On POSIX, ``os.open`` with ``O_DIRECTORY`` does not stop a rename of the
+    directory or of a parent. taskbench re-checks the canonical path
+    immediately before spawn and then keeps this descriptor until the run
+    finishes, but that does not close the swap window. A parent rename
+    after the re-check can still retarget the path. That residual risk is
+    accepted on POSIX and stated here and in the README.
     """
-    failed = False
 
-    def onerror(_err: OSError) -> None:
-        nonlocal failed
-        failed = True
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self._fd: int | None = None
+        self._handle: object | None = None
 
-    for dirpath, dirnames, _filenames in os.walk(folder, followlinks=False, onerror=onerror):
-        current = Path(dirpath)
-        kept: list[str] = []
-        for name in dirnames:
-            folded = name.casefold()
-            child = current / name
-            if folded in _ALLOWED_DOT_DIRS:
-                continue
-            if folded.startswith(".") and folded not in {".", ".."}:
-                return True
-            if child.is_symlink():
-                continue
-            kept.append(name)
-        dirnames[:] = kept
-        if failed:
-            return True
-    return failed
+    def acquire(self) -> None:
+        if os.name == "nt":
+            self._handle = _open_windows_dir_no_delete_share(self.folder)
+            return
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        self._fd = os.open(self.folder, flags)
+
+    def close(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._handle is not None:
+            _close_windows_handle(self._handle)
+            self._handle = None
+
+
+def _open_windows_dir_no_delete_share(folder: Path) -> object:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    generic_read = 0x80000000
+    file_share_read = 0x1
+    file_share_write = 0x2
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        str(folder),
+        generic_read,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle == invalid or handle is None:
+        raise OSError(f"could not hold the workdir {folder}")
+    return handle
+
+
+def _close_windows_handle(handle: object) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(handle)
 
 
 def windows_canonical_path(path: str, *, short_names: dict[str, str] | None = None) -> str:

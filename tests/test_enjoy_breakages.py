@@ -15,7 +15,15 @@ from taskbench.state import StateStore
 from taskbench.task_format import parse_yaml
 from taskbench.ui.server import TaskbenchServer
 from taskbench.workdir import is_registered, load_registry
-from tests.support import TempApp, base_packet, command_write_marker, packet_status, run_until, write_packet
+from tests.support import (
+    TempApp,
+    base_packet,
+    command_write_marker,
+    login_session,
+    packet_status,
+    run_until,
+    write_packet,
+)
 
 
 def _free_port() -> int:
@@ -74,7 +82,7 @@ class StaleModelLabel(TempApp):
         packet["model"] = {"requested": "model-a", "actual": "model-a"}
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "model-1") == "done")
-        saved = parse_yaml(_read(self.store.outbox / "model-1.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "model-1.json"))
         self.assertEqual(saved["model"]["actual"], "model-b")
         self.assertEqual(saved["model"]["requested"], "model-a")
         server = TaskbenchServer(app, 0)
@@ -95,7 +103,7 @@ class StaleModelLabel(TempApp):
         packet["model"] = {"requested": "model-a", "actual": "model-a"}
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "model-2") == "done")
-        saved = parse_yaml(_read(self.store.outbox / "model-2.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "model-2.json"))
         self.assertEqual(saved["model"]["actual"], "unknown")
         self.assertNotEqual(saved["model"]["actual"], saved["model"]["requested"])
         server = TaskbenchServer(app, 0)
@@ -117,7 +125,7 @@ class WrongUsageNoticeSilentStop(TempApp):
         _config, _app, watcher = self.make(scenario="usage-limit")
         write_packet(self.store.inbox, base_packet(id="limit-1", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "limit-1") in {"blocked", "failed", "done"})
-        saved = parse_yaml(_read(self.store.outbox / "limit-1.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "limit-1.json"))
         self.assertEqual(saved["status"], "blocked")
         reason = saved["result"]["blocked_reason"]
         self.assertIn("grok-build", reason)
@@ -130,7 +138,7 @@ class WrongUsageNoticeSilentStop(TempApp):
         _config, _app, watcher = self.make(scenario="exit-no-result")
         write_packet(self.store.inbox, base_packet(id="silent-1", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "silent-1") in {"failed", "done", "blocked"})
-        saved = parse_yaml(_read(self.store.outbox / "silent-1.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "silent-1.json"))
         self.assertEqual(saved["status"], "failed")
         self.assertNotEqual(saved["status"], "done")
         self.assertIn("3", saved["result"]["blocked_reason"])
@@ -183,7 +191,7 @@ class RunnerCantAskSoItFails(TempApp):
             and packet_status(self.store, "noask-2") == "blocked",
         )
         for packet_id in ("noask-1", "noask-2"):
-            saved = parse_yaml(_read(self.store.outbox / f"{packet_id}.yaml"))
+            saved = parse_yaml(_read(self.store.outbox / f"{packet_id}.json"))
             self.assertEqual(saved["result"]["blocked_reason"], "runner cannot ask")
             self.assertIsNone(saved["runner"]["actual"])
             output = _read(self.store.outbox / f"{packet_id}.output.log")
@@ -216,7 +224,7 @@ class ModeRunsCommandsWithNoPrompt(TempApp):
         watcher.request_decision("ask-1", "approved")
         run_until(watcher, lambda: packet_status(self.store, "ask-1") == "done")
         self.assertTrue((project / "ran.txt").exists())
-        saved = parse_yaml(_read(self.store.outbox / "ask-1.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "ask-1.json"))
         self.assertEqual(saved["permissions"], "ask")
         self.assertEqual(saved["approvals"][0]["command"], command)
         self.assertEqual(saved["approvals"][0]["decision"], "approved")
@@ -244,7 +252,7 @@ class ModeRunsCommandsWithNoPrompt(TempApp):
         run_until(watcher, lambda: packet_status(self.store, "allow-1") == "done")
         self.assertTrue((project / "allowed.txt").exists())
         self.assertIn(f"allow-match {command}", _read(self.store.log_path))
-        saved = parse_yaml(_read(self.store.outbox / "allow-1.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "allow-1.json"))
         self.assertEqual(saved.get("approvals") or [], [])
         argv = GrokBuildAdapter(self.app.config.runners["grok-build"]).build_command(
             prompt_file=project / "prompt.md",
@@ -303,7 +311,7 @@ class UnaskedPreviewServersThatHangTheRun(TempApp):
             sock.close()
         for name in ("child.pid", "grandchild.pid"):
             self.assertFalse(pid_alive(int(_read(marker / name))))
-        saved = parse_yaml(_read(self.store.outbox / "serve-hang.yaml"))
+        saved = parse_yaml(_read(self.store.outbox / "serve-hang.json"))
         self.assertIsNone(saved["retro"])
         self.assertTrue((self.root / "projects" / "demo-canvas" / ".taskbench" / "LAST_AGENT.md").is_file())
 
@@ -447,19 +455,17 @@ class RemoteEditsNeedDesktopReview(TempApp):
         conn.request("GET", "/task/edit-1")
         response = conn.getresponse()
         body = response.read().decode("utf-8")
-        cookie = response.getheader("Set-Cookie").split(";")[0]
         conn.close()
         self.assertIn("hello from taskbench", body)
         self.assertIn("<pre class='diff'>", body)
-        token = re.search(r"name='csrf' value='([^']+)'", body).group(1)
-        launch = re.search(r"name='launch' value='([^']+)'", body).group(1)
+        token, cookie = login_session(port, app)
         notes = self.root / "projects" / "demo-canvas" / "notes.txt"
         self.assertFalse(notes.exists())
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request(
             "POST",
             "/task/edit-1/approve",
-            body=f"csrf={token}&launch={launch}&command=ignore-this",
+            body=f"csrf={token}&command=ignore-this",
             headers={
                 "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -515,7 +521,7 @@ class PreviewsNeverRenderRemotely(TempApp):
         conn.close()
         server2.shutdown()
         server2.server_close()
-        self.assertIn("/outbox/files-1.yaml", done_body)
+        self.assertIn("/outbox/files-1.json", done_body)
         self.assertIn("/artifact/files-1/canvas-v2.html", done_body)
         self.assertNotIn("<iframe", done_body.lower())
         self.assertNotIn("busy", done_body.lower())
@@ -537,7 +543,7 @@ class BotWorkdirTrust(TempApp):
         rejected["workdir"] = str(self.root / "missing-folder")
         write_packet(self.store.inbox, rejected)
         run_until(watcher, lambda: packet_status(self.store, "bad-dir") == "blocked")
-        saved_bad = parse_yaml(_read(self.store.outbox / "bad-dir.yaml"))
+        saved_bad = parse_yaml(_read(self.store.outbox / "bad-dir.json"))
         self.assertEqual(saved_bad["result"]["blocked_reason"], "invalid workdir")
         self.assertEqual(load_registry(self.root / "var"), [])
 
@@ -545,7 +551,7 @@ class BotWorkdirTrust(TempApp):
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
         run_until(watcher, lambda: packet_status(self.store, "bot-dir") == "needs-approval")
-        waiting = parse_yaml(_read(self.store.needs_approval / "bot-dir.yaml"))
+        waiting = parse_yaml(_read(self.store.needs_approval / "bot-dir.json"))
         resolved = str(folder.resolve())
         self.assertEqual(waiting["status"], "needs-approval")
         self.assertEqual(waiting["workdir"], resolved)
@@ -567,7 +573,7 @@ class BotWorkdirTrust(TempApp):
 
         watcher.request_decision("bot-dir", "denied")
         run_until(watcher, lambda: packet_status(self.store, "bot-dir") == "blocked")
-        denied = parse_yaml(_read(self.store.outbox / "bot-dir.yaml"))
+        denied = parse_yaml(_read(self.store.outbox / "bot-dir.json"))
         self.assertEqual(denied["result"]["blocked_reason"], "refused workdir")
         self.assertFalse(is_registered(self.root / "var", folder.resolve()))
 
@@ -575,15 +581,14 @@ class BotWorkdirTrust(TempApp):
         again["workdir"] = str(folder)
         write_packet(self.store.inbox, again)
         run_until(watcher, lambda: packet_status(self.store, "bot-dir-2") == "needs-approval")
-        csrf = re.search(r"name='csrf' value='([^']+)'", page).group(1)
-        launch = re.search(r"name='launch' value='([^']+)'", page).group(1)
+        csrf, cookie = login_session(int(server.server_address[1]), app)
         reg = http.client.HTTPConnection("127.0.0.1", int(server.server_address[1]), timeout=5)
         reg.request(
             "POST",
             "/register-workdir",
-            body=f"csrf={csrf}&launch={launch}&path={resolved}",
+            body=f"csrf={csrf}&path={resolved}",
             headers={
-                "Cookie": "taskbench_csrf=" + csrf,
+                "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": f"http://127.0.0.1:{server.server_address[1]}",
             },

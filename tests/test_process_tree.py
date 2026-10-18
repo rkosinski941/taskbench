@@ -10,6 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
+from taskbench.launch import runner_guard
 from taskbench.process_tree import KILL_METHOD, ManagedProcess, listening_ports, pid_alive
 
 FAKE = Path(__file__).resolve().parent / "fixtures" / "fake_runner.py"
@@ -26,11 +27,12 @@ class ProcessTreeTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         marker = Path(tmp.name)
-        proc = ManagedProcess(
-            [sys.executable, str(FAKE), "--scenario", "tree", "--marker-dir", str(marker)],
-            cwd=marker,
-            env=os.environ.copy(),
-        )
+        with runner_guard():
+            proc = ManagedProcess(
+                [sys.executable, str(FAKE), "--scenario", "tree", "--marker-dir", str(marker)],
+                cwd=marker,
+                env=os.environ.copy(),
+            )
         self.addCleanup(proc.kill_tree)
         deadline = time.time() + 5
         while time.time() < deadline and not (marker / "ready").is_file():
