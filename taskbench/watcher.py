@@ -410,6 +410,15 @@ class Watcher:
         if code is None:
             return "running"
         if not self.proc.output_closed():
+            # A fast Windows exit can be visible before the reader thread has
+            # copied stdout. Reaping immediately kills the job and drops that
+            # output, so the run never sees init and never finishes.
+            reap_after = self.run_state.get("reap_after")
+            if not isinstance(reap_after, float):
+                self.run_state["reap_after"] = time.monotonic() + 2
+                return "running"
+            if time.monotonic() < reap_after:
+                return "running"
             self.proc.reap_group()
             return "running"
         return self._finish_exit(packet, code)

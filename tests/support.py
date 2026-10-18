@@ -124,7 +124,14 @@ def run_until(watcher: Watcher, predicate, timeout: float = 20.0) -> None:
         if predicate():
             return
         time.sleep(0.05)
-    raise AssertionError("timed out waiting for watcher")
+    store = getattr(watcher, "store", None)
+    tail = ""
+    if store is not None and hasattr(store, "log_path"):
+        log_path = store.log_path
+        if log_path.is_file():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n" + "\n".join(lines[-15:])
+    raise AssertionError("timed out waiting for watcher" + tail)
 
 
 def packet_status(store: StateStore, packet_id: str) -> str | None:
