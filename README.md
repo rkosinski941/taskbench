@@ -62,11 +62,16 @@ can still answer; the dead process group is killed first.
   `127.0.0.1` or `localhost` (with the port), plus names listed in
   `allowed_hosts` (empty by default). POST checks a per-session CSRF cookie.
 - Grok Build is pinned to `--permission-mode dontAsk` and `--sandbox strict`.
-  Those flags are placed immediately after the executable. A later copy is
-  removed. `--` (end of options) is rejected in `args_template` and in the
-  built argv. `can_ask` defaults to false, so `ask` and `allow-list` packets
-  are blocked before the process starts. `--always-approve`, `--yolo`,
-  `--allow`, `--auto-approve`, and any other permission flag are rejected.
+  For the `grok` executable those flags are the first arguments. A later copy
+  is removed, so nothing after the pins can override them. When the executable
+  is a Python interpreter (the test stub), the script path stays between the
+  interpreter and the pins so CPython does not treat the pins as its own
+  options; every permission flag is still stripped and the canonical pins
+  come before the remaining arguments. `--` (end of options) is rejected in
+  `args_template` and in the built argv. `can_ask` defaults to false, so
+  `ask` and `allow-list` packets are blocked before the process starts.
+  `--always-approve`, `--yolo`, `--allow`, `--auto-approve`, and any other
+  permission flag are rejected.
 - Mode detection is best-effort. The real Grok CLI does not emit
   `TASKBENCH` permission lines. The review named an init `permissionMode`
   and did not include a captured line, so taskbench does not guess from

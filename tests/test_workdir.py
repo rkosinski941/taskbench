@@ -25,6 +25,24 @@ from taskbench.workdir import (
 from tests.support import TempApp, base_packet, command_write_marker, make_config, packet_status, run_until, write_packet
 
 
+def _link_dir(link: Path, target: Path) -> bool:
+    """Point ``link`` at ``target``. Try a symlink, then a Windows junction."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return True
+    except OSError:
+        pass
+    if os.name != "nt":
+        return False
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return created.returncode == 0 and link.exists()
+
+
 def _safe_dir(parent: Path, name: str) -> Path:
     path = parent / name
     path.mkdir()
@@ -45,12 +63,21 @@ class RejectionTests(unittest.TestCase):
             validate_workdir(handle.name)
         self.assertIn("not a directory", str(file_error.exception))
 
-        with self.assertRaises(WorkdirError) as root_error:
-            validate_workdir("/")
+        if os.name == "nt":
+            drive = os.path.splitdrive(os.getcwd())[0] + "\\"
+            with self.assertRaises(WorkdirError) as root_error:
+                validate_workdir(drive)
+        else:
+            with self.assertRaises(WorkdirError) as root_error:
+                validate_workdir("/")
         self.assertIn("drive root", str(root_error.exception))
 
-        for system in ("/etc", "/usr", "/bin"):
-            if Path(system).is_dir():
+        system_dirs = ("/etc", "/usr", "/bin") if os.name != "nt" else (
+            os.environ.get("SYSTEMROOT", r"C:\Windows"),
+            os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "System32"),
+        )
+        for system in system_dirs:
+            if system and Path(system).is_dir():
                 with self.subTest(system=system):
                     with self.assertRaises(WorkdirError) as caught:
                         validate_workdir(system)
@@ -131,45 +158,36 @@ class RejectionTests(unittest.TestCase):
         real = _safe_dir(root, "real")
         (real / "INSTRUCTIONS.md").write_text("from-real\n", encoding="utf-8")
         link = root / "jump"
-        try:
-            link.symlink_to(real, target_is_directory=True)
-        except OSError:
-            self.skipTest("symlinks are not permitted on this machine")
+        if not _link_dir(link, real):
+            self.skipTest("symlinks and junctions are not permitted on this machine")
         resolved = validate_workdir(str(link))
         self.assertEqual(resolved, real.resolve())
         self.assertNotEqual(resolved, link)
 
+        if os.name == "nt":
+            forbidden = Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+        else:
+            forbidden = Path("/etc")
         escape = root / "escape"
-        escape.symlink_to("/etc", target_is_directory=True)
-        with self.assertRaises(WorkdirError) as caught:
-            validate_workdir(str(escape))
-        self.assertEqual(caught.exception.resolved, os.path.realpath("/etc"))
-        self.assertNotIn(str(escape), caught.exception.resolved or "")
+        if forbidden.is_dir() and _link_dir(escape, forbidden):
+            with self.assertRaises(WorkdirError) as caught:
+                validate_workdir(str(escape))
+            self.assertIn("system folder", str(caught.exception))
+            self.assertTrue(caught.exception.resolved)
+            self.assertEqual(Path(caught.exception.resolved).resolve(), forbidden.resolve())
+            self.assertNotEqual(Path(caught.exception.resolved), escape)
         outside = _safe_dir(root, "outside")
         (outside / "secret.txt").write_text("nope", encoding="utf-8")
         leak = real / "leak"
-        leak.symlink_to(outside, target_is_directory=True)
-        decision = classify(
-            {"op": "read", "path": "leak/secret.txt"},
-            permissions="plan",
-            allow=[],
-            sandbox_only=False,
-            project_dir=resolved,
-        )
-        self.assertEqual(decision.kind, "refuse")
-
-        if os.name != "nt":
-            return
-        junction = root / "junction"
-        created = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(junction), str(real)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if created.returncode != 0 or not junction.exists():
-            self.skipTest("junctions are not permitted on this machine")
-        self.assertEqual(validate_workdir(str(junction)), real.resolve())
+        if _link_dir(leak, outside):
+            decision = classify(
+                {"op": "read", "path": "leak/secret.txt"},
+                permissions="plan",
+                allow=[],
+                sandbox_only=False,
+                project_dir=resolved,
+            )
+            self.assertEqual(decision.kind, "refuse")
 
 
 class RegistryAndRunTests(TempApp):

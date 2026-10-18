@@ -2,7 +2,7 @@
 
 ``args_template`` may use ``{prompt_file}``, ``{project_dir}``, and
 ``{timeout_s}``. taskbench places ``--permission-mode dontAsk`` and
-``--sandbox strict`` immediately after the executable and strips any later
+``--sandbox strict`` before every other flag and strips any later
 copy of those flags. ``--`` is rejected in the template and in the built
 argv. Other permission flags (``--always-approve``, ``--allow``,
 ``--auto-approve``, ``--yolo``, and unknown permission flags) are rejected.

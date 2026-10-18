@@ -1,8 +1,11 @@
 """Permission flags and the child-process environment.
 
 Grok Build is pinned to ``--permission-mode dontAsk`` and ``--sandbox strict``.
-Those two flags are placed immediately after the executable so a later
-argument cannot override them. ``--`` (end of options) is rejected. Anything
+For ``grok`` those two flags are the first arguments, so a later argument
+cannot override them. When the executable is a Python interpreter and the
+next token is a script path, that path stays between the interpreter and
+the pins (CPython would otherwise treat the pins as its own options).
+``--`` (end of options) is rejected. Anything
 else that looks like a permission flag is rejected. The child does not
 inherit the parent environment: only an explicit allow-list is copied, then
 ``TASKBENCH_APPROVALS=1`` is set by taskbench itself.
@@ -204,17 +207,38 @@ def _without_pin_flags(args: list[str]) -> list[str]:
     return kept
 
 
+def _interpreter_script(executable: str, rest: list[str]) -> list[str]:
+    """Keep a script path in front of the pins when argv[0] is Python.
+
+    ``grok`` receives the pins as its first arguments. A Python interpreter
+    would treat those same flags as its own and never start the stub, so the
+    script path stays between the interpreter and the pins. It is not a flag.
+    Every permission flag is still removed and the canonical pins are placed
+    before the remaining arguments.
+    """
+    name = Path(executable).name.lower()
+    if name not in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}:
+        return []
+    if not rest or rest[0].startswith("-"):
+        return []
+    return [rest.pop(0)]
+
+
 def ensure_pinned_args(args: list[str]) -> list[str]:
-    """Validate flags, then put the pins immediately after argv[0].
+    """Validate flags, then put the pins before every other flag.
 
     Later copies of the same flags are removed so nothing after the pins can
-    override them. ``--`` anywhere in the list is an error.
+    override them. ``--`` anywhere in the list is an error. For ``grok`` the
+    pins are the first arguments. See ``_interpreter_script`` for the Python
+    stub used in tests.
     """
     if not args or not str(args[0]).strip():
         raise PermissionFlagError("refusing empty argv")
     check_permission_args(args)
-    rest = _without_pin_flags(list(args[1:]))
-    return [args[0], "--permission-mode", "dontAsk", "--sandbox", "strict", *rest]
+    rest = list(args[1:])
+    script = _interpreter_script(args[0], rest)
+    rest = _without_pin_flags(rest)
+    return [args[0], *script, "--permission-mode", "dontAsk", "--sandbox", "strict", *rest]
 
 
 def unexpected_permission(event: dict) -> str | None:

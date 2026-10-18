@@ -59,6 +59,14 @@ class PinOrderTests(unittest.TestCase):
                 "p",
             ],
         )
+        interpreter = ensure_pinned_args(
+            [sys.executable, "fake_runner.py", "--cwd", "x", "--permission-mode", "dontAsk"]
+        )
+        self.assertEqual(interpreter[1], "fake_runner.py")
+        self.assertEqual(
+            interpreter[2:6],
+            ["--permission-mode", "dontAsk", "--sandbox", "strict"],
+        )
         for args in (["--"], ["--cwd", "x", "--", "--allow", "Bash"], ["--prompt", "--"]):
             with self.subTest(args=args):
                 with self.assertRaises(PermissionFlagError):

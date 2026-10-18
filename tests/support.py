@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -20,29 +19,6 @@ from taskbench.watcher import Watcher
 
 FAKE = Path(__file__).resolve().parent / "fixtures" / "fake_runner.py"
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _fake_executable(root: Path) -> tuple[str, list[str]]:
-    """Return ``(executable, leading args)`` for the stub runner.
-
-    Pinned Grok flags are placed immediately after the executable. The
-    stub therefore has to be argv[0], not an argument of the Python
-    interpreter, or CPython treats those flags as its own.
-    """
-    if os.name == "nt":
-        launcher = root / "fake-runner.cmd"
-        launcher.write_text(
-            f'@echo off\r\n"{sys.executable}" "{FAKE}" %*\r\n',
-            encoding="utf-8",
-        )
-        return str(launcher), []
-    launcher = root / "fake_runner.py"
-    body = FAKE.read_text(encoding="utf-8")
-    if not body.startswith("#!"):
-        body = "#!/usr/bin/env python3\n" + body
-    launcher.write_text(body, encoding="utf-8")
-    launcher.chmod(0o755)
-    return str(launcher), []
 
 
 def make_config(
@@ -61,9 +37,8 @@ def make_config(
     demo = projects / "demo-canvas"
     if not (demo / "INSTRUCTIONS.md").is_file():
         shutil.copytree(ROOT / "examples" / "demo-canvas", demo, dirs_exist_ok=True)
-    executable, prefix = _fake_executable(root)
     args = [
-        *prefix,
+        str(FAKE),
         "--scenario",
         scenario,
         "--prompt-file",
@@ -76,7 +51,7 @@ def make_config(
     runner = RunnerConfig(
         name="grok-build",
         adapter="grok_build",
-        executable=executable,
+        executable=__import__("sys").executable,
         args_template=args,
         can_ask=can_ask,
         sandbox_only=sandbox_only,
