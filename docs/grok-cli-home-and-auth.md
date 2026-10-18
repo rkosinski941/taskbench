@@ -97,7 +97,7 @@ process also sets `GROK_CLAUDE_HOOKS_ENABLED=0`,
 `GROK_CURSOR_MCPS_ENABLED=0`, which that page documents as the scanner
 switches (default on). A repo `.grok/config.toml` can still contribute
 `[mcp_servers]` and `[plugins]`, and Claude or Cursor settings can define
-hooks and MCP servers. taskbench sends that task to Needs you and names
+hooks, MCP servers, and Claude `enabledPlugins`. taskbench sends that task to Needs you and names
 the file and the keys. The JSON file keeps the Claude-compatible
 `permissions` object. The deny list is `Read(<path>)` and
 `Read(<path>/**)` for the pinned home and for the real profile's `.grok` and

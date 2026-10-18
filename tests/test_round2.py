@@ -81,7 +81,7 @@ class PinOrderTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         target = Path(tmp.name) / "config.json"
-        target.write_text(text.replace('"--cwd"', '"--", "--cwd"', 1), encoding="utf-8")
+        target.write_text(text.replace('"--prompt-file"', '"--", "--prompt-file"', 1), encoding="utf-8")
         with self.assertRaises(ConfigError) as caught:
             load_config(target)
         self.assertIn("end-of-options", str(caught.exception))

@@ -116,7 +116,7 @@ class PermissionFlagError(ValueError):
 
 
 # Grok's Claude and Cursor scanners default to on. A repo can then start MCP
-# servers, plugins, or hooks without a tool call for taskbench to deny.
+# servers, plugins, enabled plugins, or hooks without a tool call for taskbench to deny.
 # https://docs.x.ai/build/settings/reference lists these four variables.
 GROK_SCANNER_DISABLES = {
     "GROK_CLAUDE_HOOKS_ENABLED": "0",
@@ -947,24 +947,51 @@ def _mode_is_problem(value: object) -> bool:
 
 
 def _exec_canon(key: str) -> str | None:
-    """MCP, plugin, and hook keys. Matched without case or separator."""
+    """MCP, plugin, enabled-plugin, and hook keys. Matched without case or separator."""
     norm = _snake_key(key)
     if norm in {"mcp_servers", "mcp_server", "mcps"}:
         return "mcp_servers"
     if norm in {"plugins", "plugin"}:
         return "plugins"
+    if norm in {"enabled_plugins", "enabled_plugin"}:
+        return "enabled_plugins"
     if norm == "hooks":
         return "hooks"
     return None
 
 
-def _defines_exec(value: object) -> bool:
+def _enabled_plugins_value(value: object) -> bool:
+    """Claude ``enabledPlugins`` counts when it names a plugin that is on.
+
+    ``false`` and ``{}`` do not. ``{"name": true}`` does. A map whose values
+    are all false does not.
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_enabled_plugins_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _truthy_switch(item) or (isinstance(item, dict) and _enabled_plugins_value(item))
+            for item in value.values()
+        )
+    return False
+
+
+def _defines_exec(value: object, *, key: str | None = None) -> bool:
     """True when a value actually names a server, plugin, or hook.
 
     ``false`` and empty lists do not. A nested table does: an MCP server
     entry counts even when its own table is empty. A ``disabled = []``
-    plugins table does not. An empty ``{}`` does not.
+    plugins table does not. An empty ``{}`` does not. Claude's
+    ``enabledPlugins`` map counts when a named plugin is on.
     """
+    if key is not None and _exec_canon(key) == "enabled_plugins":
+        return _enabled_plugins_value(value)
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, (list, tuple, set)):
@@ -1015,7 +1042,7 @@ def _json_problem_keys(data: object, found: list[str]) -> None:
         for key, value in data.items():
             if _key_is_problem(str(key), value):
                 _remember(found, _canonical_rule_key(str(key)))
-            if _defines_exec(value):
+            if _defines_exec(value, key=str(key)):
                 _remember(found, _exec_canon(str(key)))
             if isinstance(value, (dict, list)):
                 _json_problem_keys(value, found)
@@ -1167,8 +1194,9 @@ def scan_project_permission_rules(project: Path) -> list[tuple[str, tuple[str, .
     whichever comes first. The profile directory is included. The drive root
     is not. ``.grok``, ``.claude``, and ``.cursor`` symlinks and junctions are
     followed to their targets on every OS. Keys and mode values are matched
-    case-insensitively. A file that defines MCP servers, plugins, or hooks is
-    a finding, the same as an allow rule. Unreadable or unparsed files are
+    case-insensitively. A file that defines MCP servers, plugins, Claude
+    ``enabledPlugins``, or hooks is a finding, the same as an allow rule.
+    Unreadable or unparsed files are
     findings (Needs you), not skips. Values are not returned.
     """
     root = Path(project)
@@ -1198,6 +1226,7 @@ def needs_you_message(findings: list[tuple[str, tuple[str, ...]]]) -> str:
     parts = [f"{rel} [{', '.join(keys)}]" for rel, keys in findings]
     return (
         "Needs you: project settings could not be checked or contain "
-        "auto-approve or allow rules, or they define MCP servers, plugins, or hooks; "
+        "auto-approve or allow rules, or they define MCP servers, plugins, "
+        "enabled plugins, or hooks; "
         "remove or repair them before this task can run: " + "; ".join(parts)
     )

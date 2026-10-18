@@ -100,7 +100,7 @@ class PinnedPermissionTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         for snippet, replacement in (
-            ('"--cwd"', '"--always-approve", "--cwd"'),
+            ('"--prompt-file"', '"--always-approve", "--prompt-file"'),
             ('"can_ask"', '"allow": ["Bash"], "can_ask"'),
             ('"can_ask"', '"auto_approve": true, "can_ask"'),
         ):

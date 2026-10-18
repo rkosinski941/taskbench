@@ -55,6 +55,10 @@ BANNED_ARG_PARTS = (
     "skip_approval",
 )
 
+# taskbench starts the child in the confirmed workdir. These flags would
+# point Grok at a different directory or a different config file.
+OWNED_TEMPLATE_FLAGS = frozenset({"-c", "--config", "--cwd"})
+
 
 class ConfigError(ValueError):
     pass
@@ -173,6 +177,12 @@ def _load_runners(raw: object) -> dict[str, RunnerConfig]:
             lowered = arg.lower()
             if any(part in lowered for part in BANNED_ARG_PARTS):
                 raise ConfigError(f"runner {name} args_template contains a banned flag")
+            token = lowered.split("=", 1)[0] if lowered.startswith("-") else ""
+            if token in OWNED_TEMPLATE_FLAGS:
+                raise ConfigError(
+                    f"runner {name} args_template must not pass {token}; "
+                    "taskbench sets the working directory itself"
+                )
         default_can_ask = False
         runners[name] = RunnerConfig(
             name=name,

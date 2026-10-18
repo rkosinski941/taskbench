@@ -103,7 +103,7 @@ can still answer; the dead process group is killed first.
   `allow`, a true `yolo` / `always-approve` / `auto-approve` /
   `bypassPermissions`, or a `permission_mode` / `defaultMode` other than
   `dontAsk` blocks the task. So does a file that defines MCP servers,
-  plugins, or hooks: Grok can run those without a tool call, and Windows
+  plugins, Claude `enabledPlugins`, or hooks: Grok can run those without a tool call, and Windows
   has no sandbox. A settings file that cannot be read or parsed blocks the
   task too. The status stays `blocked`. The page shows **Needs you** and
   names the file and the keys, not the values. Deny-only files still run.
@@ -183,7 +183,8 @@ Set `executable` and `args_template` yourself. Placeholders are
 `{prompt_file}`, `{project_dir}`, and `{timeout_s}`. The example template
 passes the prompt with `--prompt-file`. That flag, and `-p, --single` for
 an inline prompt, are the headless flags in the Grok user guide. There is
-no `--prompt` flag. Change the `--prompt-file` string in `args_template`
+no `--prompt` flag. taskbench sets the process working directory itself and
+rejects `--cwd`, `-c`, and `--config` in `args_template`. Change the `--prompt-file` string in `args_template`
 if `grok --help` prints a different name. That is config, not a code change.
 See <https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md>.
 taskbench puts `--permission-mode dontAsk`, `--sandbox strict`, and

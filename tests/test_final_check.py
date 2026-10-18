@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from taskbench.adapters.grok_build import GrokBuildAdapter
-from taskbench.config import RunnerConfig
+from taskbench.config import ConfigError, RunnerConfig, load_config
 from taskbench.permissions import (
     GROK_SCANNER_DISABLES,
     apply_grok_scanner_locks,
@@ -195,6 +195,27 @@ class ExecScanTests(unittest.TestCase):
         self.assertIn("hooks", message)
         self.assertNotIn("parent-hook", message)
 
+    def test_claude_enabled_plugins_need_you(self) -> None:
+        project = self._project()
+        (project / ".claude").mkdir()
+        (project / ".claude" / "settings.json").write_text(
+            '{"enabledPlugins":{"some-plugin":true}}\n',
+            encoding="utf-8",
+        )
+        message = needs_you_message(scan_project_permission_rules(project))
+        self.assertIn(".claude/settings.json", message)
+        self.assertIn("enabled_plugins", message)
+        self.assertNotIn("some-plugin", message)
+        for body in (
+            '{"enabledPlugins":{}}\n',
+            '{"enabledPlugins":false}\n',
+            '{"enabledPlugins":{"some-plugin":false}}\n',
+        ):
+            empty = self._project()
+            (empty / ".claude").mkdir()
+            (empty / ".claude" / "settings.json").write_text(body, encoding="utf-8")
+            self.assertEqual(scan_project_permission_rules(empty), [])
+
 
 class PromptFlagTests(unittest.TestCase):
     def test_prompt_file_flag_comes_from_the_runner_config(self) -> None:
@@ -224,6 +245,25 @@ class PromptFlagTests(unittest.TestCase):
         self.assertIn("14-headless-mode.md", modes)
         self.assertIn("no `--prompt` flag", modes)
 
+    def test_args_template_rejects_cwd_and_config_flags(self) -> None:
+        text = (ROOT / "config.example.json").read_text(encoding="utf-8")
+        self.assertNotIn('"--cwd"', text)
+        loaded = load_config(ROOT / "config.example.json")
+        self.assertNotIn("--cwd", loaded.runners["grok-build"].args_template)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for flag in ("--cwd", "-c", "--config", "--CWD", "--config=elsewhere"):
+            target = Path(tmp.name) / "config.json"
+            target.write_text(
+                text.replace('"--prompt-file"', f'"{flag}", "--prompt-file"', 1),
+                encoding="utf-8",
+            )
+            with self.subTest(flag=flag):
+                with self.assertRaises(ConfigError) as caught:
+                    load_config(target)
+                self.assertIn(flag.split("=", 1)[0].lower(), str(caught.exception))
+                self.assertIn("working directory", str(caught.exception))
+
 
 class LaptopProbeScriptTests(unittest.TestCase):
     def test_script_and_plan_do_not_delete_real_settings(self) -> None:
@@ -242,8 +282,15 @@ class LaptopProbeScriptTests(unittest.TestCase):
         self.assertIn("# END TASKBENCH-PROBE", script)
         self.assertIn("UTF8Encoding($false)", script)
         self.assertIn("[System.IO.File]::WriteAllText", script)
+        self.assertIn("ConvertFrom-Json", script)
+        self.assertIn("Bash(echo TASKBENCH-PROBE*)", script)
+        self.assertIn("taskbench-created", script)
+        self.assertIn(".used", script)
+        self.assertIn("no probe marker", script)
+        self.assertIn("tomllib", script)
         code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotIn("Set-Content", code)
+        self.assertNotIn("\\s+", code)
         self.assertNotIn("%USERPROFILE%", script)
         self.assertNotIn("Remove-Item -LiteralPath $grokToml", script)
         self.assertNotIn("Remove-Item -LiteralPath $claudeJson", script)
@@ -252,8 +299,9 @@ class LaptopProbeScriptTests(unittest.TestCase):
             if "Copy-Item" in line:
                 self.assertNotIn("-Force", line)
         self.assertIn("-DryRun", script)
-        self.assertIn("already matches", script)
-        self.assertIn("no planted lines", script)
+        self.assertIn("ConvertFrom-Json", plan)
+        self.assertIn("taskbench-created", plan)
+        self.assertIn(".used", plan)
         self.assertIn("laptop-probe.ps1", plan)
         self.assertIn("-Backup", plan)
         self.assertIn("-Plant", plan)
@@ -280,8 +328,9 @@ class LaptopProbeScriptTests(unittest.TestCase):
         self.assertIn("--prompt-file", readme)
         self.assertIn("no `--prompt` flag", readme)
 
-    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
-    def test_cleanup_restores_and_a_second_run_keeps_the_file(self) -> None:
+    def _probe_profile(self) -> tuple[str, Path]:
+        if os.name != "nt":
+            self.skipTest("the probe script runs under Windows PowerShell")
         if Path(r"C:\taskbench-probe").exists():
             self.skipTest("C:\\taskbench-probe already exists")
         powershell = shutil.which("powershell") or shutil.which("powershell.exe")
@@ -292,80 +341,271 @@ class LaptopProbeScriptTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(tmp.cleanup)
         profile = Path(tmp.name) / "profile"
-        (profile / ".grok").mkdir(parents=True)
-        live = profile / ".grok" / "config.toml"
-        original = 'owner = "keep-me"\n'
-        live.write_text(original, encoding="utf-8")
-        script = ROOT / "scripts" / "laptop-probe.ps1"
+        profile.mkdir()
+        return powershell, profile
 
-        def run(*args: str) -> subprocess.CompletedProcess[str]:
-            env = os.environ.copy()
-            env["USERPROFILE"] = str(profile)
-            return subprocess.run(
-                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), *args],
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+    def _probe(self, powershell: str, profile: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["USERPROFILE"] = str(profile)
+        return subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "scripts" / "laptop-probe.ps1"),
+                *args,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
 
-        dry = run("-Backup", "-DryRun")
-        self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertEqual(list((profile / ".grok").glob("config.toml.taskbench-backup-*")), [])
-        backed = run("-Backup")
-        self.assertEqual(backed.returncode, 0, backed.stderr)
-        backups = list((profile / ".grok").glob("config.toml.taskbench-backup-*"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
-        again = run("-Backup")
-        self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertEqual(len(list((profile / ".grok").glob("config.toml.taskbench-backup-*"))), 1)
-        planted = run("-Plant", "-Which", "grok")
-        self.assertEqual(planted.returncode, 0, planted.stderr)
-        body = live.read_text(encoding="utf-8")
-        self.assertIn('owner = "keep-me"', body)
-        self.assertIn("# BEGIN TASKBENCH-PROBE", body)
-        self.assertIn("# END TASKBENCH-PROBE", body)
-        self.assertNotIn("TASKBENCH-PROBE", backups[0].read_text(encoding="utf-8"))
-        refused = run("-Backup")
-        self.assertEqual(refused.returncode, 0, refused.stderr)
-        self.assertEqual(len(list((profile / ".grok").glob("config.toml.taskbench-backup-*"))), 1)
-        self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
-        cleaned = run("-Cleanup")
-        self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
-        self.assertEqual(live.read_text(encoding="utf-8"), original)
-        self.assertTrue(backups[0].is_file())
-        cleaned_again = run("-Cleanup")
-        self.assertEqual(cleaned_again.returncode, 0, cleaned_again.stderr)
-        self.assertEqual(live.read_text(encoding="utf-8"), original)
-        backups[0].unlink()
-        live.write_text(
-            "# BEGIN TASKBENCH-PROBE\n[permission]\nallow = [\"Bash(echo TASKBENCH-PROBE*)\"]\n# END TASKBENCH-PROBE\n",
+    @staticmethod
+    def _backups(directory: Path, prefix: str) -> tuple[list[Path], list[Path]]:
+        found = list(directory.glob(prefix + "*"))
+        live = [path for path in found if not path.name.endswith(".used")]
+        used = [path for path in found if path.name.endswith(".used")]
+        return live, used
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_a_claude_created_file_is_removed_on_cleanup(self) -> None:
+        powershell, profile = self._probe_profile()
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "claude")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        claude = profile / ".claude" / "settings.json"
+        sidecar = Path(str(claude) + ".taskbench-created")
+        self.assertTrue(claude.is_file())
+        self.assertTrue(sidecar.is_file())
+        self.assertIn("Bash(echo TASKBENCH-PROBE*)", claude.read_text(encoding="utf-8"))
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertFalse(claude.exists())
+        self.assertFalse(sidecar.exists())
+        self.assertNotIn("no planted lines", cleaned.stdout)
+        again = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
+        self.assertFalse(claude.exists())
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_b_existing_claude_without_backup_keeps_other_keys(self) -> None:
+        powershell, profile = self._probe_profile()
+        claude = profile / ".claude" / "settings.json"
+        claude.parent.mkdir()
+        original = '{"model":"keep","theme":"dark"}\n'
+        claude.write_text(original, encoding="utf-8", newline="\n")
+        refused = self._probe(powershell, profile, "-Plant", "-Which", "claude")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("backup", (refused.stderr + refused.stdout).lower())
+        self.assertEqual(claude.read_bytes(), original.encode("utf-8"))
+        claude.write_text(
+            '{"model":"keep","permissions":{"deny":["Read(C:\\\\secret)"],"allow":["Bash(git status)","Bash(echo TASKBENCH-PROBE*)"]},"theme":"dark"}\n',
             encoding="utf-8",
             newline="\n",
         )
-        stripped = run("-Cleanup")
-        self.assertEqual(stripped.returncode, 0, stripped.stderr)
-        self.assertTrue(live.is_file())
-        self.assertNotIn("TASKBENCH-PROBE", live.read_text(encoding="utf-8"))
-        stripped_again = run("-Cleanup")
-        self.assertEqual(stripped_again.returncode, 0, stripped_again.stderr)
-        self.assertTrue(live.is_file())
-        claude = profile / ".claude" / "settings.json"
-        (profile / ".claude").mkdir()
-        claude.write_text('{"model":"keep"}\n', encoding="utf-8")
-        self.assertEqual(run("-Backup").returncode, 0)
-        self.assertEqual(run("-Plant", "-Which", "claude").returncode, 0)
-        self.assertIn("TASKBENCH-PROBE", claude.read_text(encoding="utf-8"))
-        claude_backups = list((profile / ".claude").glob("settings.json.taskbench-backup-*"))
-        self.assertEqual(len(claude_backups), 1)
-        self.assertNotIn("TASKBENCH-PROBE", claude_backups[0].read_text(encoding="utf-8"))
-        self.assertEqual(run("-Cleanup").returncode, 0)
-        self.assertIn("keep", claude.read_text(encoding="utf-8"))
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        data = json.loads(claude.read_text(encoding="utf-8"))
+        self.assertEqual(data["model"], "keep")
+        self.assertEqual(data["theme"], "dark")
+        self.assertEqual(data["permissions"]["deny"], ["Read(C:\\secret)"])
+        self.assertEqual(data["permissions"]["allow"], ["Bash(git status)"])
         self.assertNotIn("TASKBENCH-PROBE", claude.read_text(encoding="utf-8"))
-        self.assertTrue(claude.is_file())
-        self.assertEqual(run("-Cleanup").returncode, 0)
-        self.assertTrue(claude.is_file())
-        self.assertIn("keep", claude.read_text(encoding="utf-8"))
+        self.assertFalse(Path(str(claude) + ".taskbench-created").exists())
+        self.assertEqual(self._backups(claude.parent, "settings.json.taskbench-backup-"), ([], []))
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_c_backup_restores_only_the_planted_file(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        original = 'owner = "keep-me"\n'
+        live.write_text(original, encoding="utf-8", newline="\n")
+        dry = self._probe(powershell, profile, "-Backup", "-DryRun")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self._backups(live.parent, "config.toml.taskbench-backup-"), ([], []))
+        backed = self._probe(powershell, profile, "-Backup")
+        self.assertEqual(backed.returncode, 0, backed.stderr)
+        live_backups, used = self._backups(live.parent, "config.toml.taskbench-backup-")
+        self.assertEqual(len(live_backups), 1)
+        self.assertEqual(used, [])
+        self.assertEqual(live_backups[0].read_bytes(), original.encode("utf-8"))
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "grok")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        body = live.read_text(encoding="utf-8")
+        self.assertIn('owner = "keep-me"', body)
+        self.assertEqual(body.count("[permission]"), 1)
+        self.assertIn("# BEGIN TASKBENCH-PROBE", body)
+        self.assertIn("# END TASKBENCH-PROBE", body)
+        tomllib.loads(body)
+        self.assertNotIn("TASKBENCH-PROBE", live_backups[0].read_text(encoding="utf-8"))
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertEqual(live.read_bytes(), original.encode("utf-8"))
+        claude = profile / ".claude" / "settings.json"
+        claude.parent.mkdir()
+        claude.write_text(
+            '{"model":"keep","permissions":{"deny":["Read(C:\\\\secret)"]}}\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        planted_json = self._probe(powershell, profile, "-Plant", "-Which", "claude")
+        self.assertEqual(planted_json.returncode, 0, planted_json.stderr + planted_json.stdout)
+        planted_data = json.loads(claude.read_text(encoding="utf-8"))
+        self.assertEqual(planted_data["model"], "keep")
+        self.assertEqual(planted_data["permissions"]["deny"], ["Read(C:\\secret)"])
+        self.assertEqual(planted_data["permissions"]["allow"], ["Bash(echo TASKBENCH-PROBE*)"])
+        restored = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(restored.returncode, 0, restored.stderr + restored.stdout)
+        self.assertEqual(
+            json.loads(claude.read_text(encoding="utf-8")),
+            {"model": "keep", "permissions": {"deny": ["Read(C:\\secret)"]}},
+        )
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_d_second_cleanup_is_a_noop(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        original = 'owner = "keep-me"\n'
+        live.write_text(original, encoding="utf-8", newline="\n")
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        self.assertEqual(self._probe(powershell, profile, "-Plant", "-Which", "grok").returncode, 0)
+        self.assertEqual(self._probe(powershell, profile, "-Cleanup").returncode, 0)
+        first = live.read_bytes()
+        again = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
+        self.assertEqual(live.read_bytes(), first)
+        self.assertIn("no probe marker", again.stdout)
+        live_backups, used = self._backups(live.parent, "config.toml.taskbench-backup-")
+        self.assertEqual(live_backups, [])
+        self.assertEqual(len(used), 1)
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_e_cleanup_without_a_probe_keeps_newer_edits(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        live.write_text('owner = "original"\n', encoding="utf-8", newline="\n")
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        newer = 'owner = "newer-edit"\n'
+        live.write_text(newer, encoding="utf-8", newline="\n")
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertEqual(live.read_bytes(), newer.encode("utf-8"))
+        self.assertIn("no probe marker", cleaned.stdout)
+        self.assertIn("unused", cleaned.stdout)
+        live_backups, used = self._backups(live.parent, "config.toml.taskbench-backup-")
+        self.assertEqual(len(live_backups), 1)
+        self.assertEqual(used, [])
+        self.assertEqual(live_backups[0].read_text(encoding="utf-8"), 'owner = "original"\n')
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_f_restored_backup_is_renamed_and_not_reused(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        original = 'owner = "original"\n'
+        live.write_text(original, encoding="utf-8", newline="\n")
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        self.assertEqual(self._probe(powershell, profile, "-Plant", "-Which", "grok").returncode, 0)
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        live_backups, used = self._backups(live.parent, "config.toml.taskbench-backup-")
+        self.assertEqual(live_backups, [])
+        self.assertEqual(len(used), 1)
+        self.assertEqual(used[0].read_bytes(), original.encode("utf-8"))
+        self.assertIn(".used", cleaned.stdout)
+        newer = 'owner = "after-restore"\n'
+        live.write_text(newer, encoding="utf-8", newline="\n")
+        again = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
+        self.assertEqual(live.read_bytes(), newer.encode("utf-8"))
+        self.assertEqual(self._backups(live.parent, "config.toml.taskbench-backup-")[1], used)
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_g_existing_permission_table_merges_and_stays_valid(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        original = 'owner = "keep"\n\n[permission]\ndeny = ["Read(C:\\\\secret)"]\n'
+        live.write_text(original, encoding="utf-8", newline="\n")
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "grok")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        body = live.read_text(encoding="utf-8")
+        self.assertEqual(body.count("[permission]"), 1)
+        self.assertIn("# BEGIN TASKBENCH-PROBE", body)
+        self.assertIn("# END TASKBENCH-PROBE", body)
+        parsed = tomllib.loads(body)
+        self.assertEqual(parsed["permission"]["allow"], ["Bash(echo TASKBENCH-PROBE*)"])
+        self.assertEqual(parsed["permission"]["deny"], ["Read(C:\\secret)"])
+        self.assertEqual(parsed["owner"], "keep")
+        planted_bytes = live.read_bytes()
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertEqual(live.read_bytes(), original.encode("utf-8"))
+        tomllib.loads(live.read_text(encoding="utf-8"))
+        live.write_bytes(planted_bytes)
+        stripped = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(stripped.returncode, 0, stripped.stderr + stripped.stdout)
+        after = live.read_text(encoding="utf-8")
+        self.assertNotIn("TASKBENCH-PROBE", after)
+        self.assertEqual(after.count("[permission]"), 1)
+        restored = tomllib.loads(after)
+        self.assertNotIn("allow", restored["permission"])
+        self.assertEqual(restored["permission"]["deny"], ["Read(C:\\secret)"])
+        self.assertEqual(restored["owner"], "keep")
+        refused_body = '[permission]\nallow = ["Bash(git *)"]\n'
+        live.write_text(refused_body, encoding="utf-8", newline="\n")
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        refused = self._probe(powershell, profile, "-Plant", "-Which", "grok")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("allow", (refused.stderr + refused.stdout).lower())
+        self.assertEqual(live.read_text(encoding="utf-8"), refused_body)
+        tomllib.loads(live.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_h_crlf_bytes_round_trip(self) -> None:
+        powershell, profile = self._probe_profile()
+        live = profile / ".grok" / "config.toml"
+        live.parent.mkdir()
+        original = 'owner = "crlf"\r\nkeep = true\r\n'.encode("utf-8")
+        live.write_bytes(original)
+        untouched = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(untouched.returncode, 0, untouched.stderr + untouched.stdout)
+        self.assertEqual(live.read_bytes(), original)
+        self.assertEqual(self._probe(powershell, profile, "-Backup").returncode, 0)
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "grok")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        self.assertIn(b"TASKBENCH-PROBE", live.read_bytes())
+        self.assertIn(b"\r\n", live.read_bytes())
+        tomllib.loads(live.read_text(encoding="utf-8"))
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertEqual(live.read_bytes(), original)
+        prefix = 'owner = "crlf"\r\n'
+        block = (
+            "# BEGIN TASKBENCH-PROBE\r\n"
+            "[permission]\r\n"
+            'allow = ["Bash(echo TASKBENCH-PROBE*)"]\r\n'
+            "# END TASKBENCH-PROBE\r\n"
+        )
+        live.write_bytes((prefix + block).encode("utf-8"))
+        for path in live.parent.glob("config.toml.taskbench-backup-*"):
+            path.unlink()
+        stripped = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(stripped.returncode, 0, stripped.stderr + stripped.stdout)
+        self.assertEqual(live.read_bytes(), prefix.encode("utf-8"))
+        claude = profile / ".claude" / "settings.json"
+        claude.parent.mkdir()
+        raw = b'{\r\n  "model": "keep"\r\n}\r\n'
+        claude.write_bytes(raw)
+        self.assertEqual(self._probe(powershell, profile, "-Cleanup").returncode, 0)
+        self.assertEqual(claude.read_bytes(), raw)
+

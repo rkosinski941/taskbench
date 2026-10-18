@@ -102,7 +102,15 @@ The second run plants only the `.claude` rule.
 .\scripts\laptop-probe.ps1 -Plant -Which grok
 ```
 
-The planted TOML block is appended. It is not a replacement of the file:
+The planted TOML block is the allow entry between marker comments. It is
+not a replacement of the file. When the file has no `[permission]` table,
+the block includes that table. When `[permission]` already exists and has
+no `allow` key, the script inserts the allow entry inside that table,
+between the same marker comments, and does not write a second
+`[permission]` table. It then checks that the file parses with `python -c`
+and `tomllib` when that module imports. If Python or `tomllib` is missing,
+the documented check is one `[permission]` table and a matched pair of
+marker comments.
 
 ```toml
 # BEGIN TASKBENCH-PROBE
@@ -111,7 +119,9 @@ allow = ["Bash(echo TASKBENCH-PROBE*)"]
 # END TASKBENCH-PROBE
 ```
 
-The rule sits under `[permission]`, not at the top of the file. Leave
+The rule sits under `[permission]`, not at the top of the file. When the
+`.grok` file did not exist, the script also writes
+`config.toml.taskbench-created` beside it. Leave
 `$env:USERPROFILE\.claude\settings.json` without a `TASKBENCH-PROBE` rule
 for this run.
 
@@ -187,13 +197,19 @@ home and its deny-read rules, not from taskbench executing the echo.
 
 ## Second run: only the `.claude` rule
 
-Stop taskbench. This invocation restores the `.grok` file from its backup
-when that backup exists, and it does not delete the backup or the live file.
-Then plant only the `.claude` rule. The JSON file stays valid JSON. The
-planted document is `permissions.allow` set to `Bash(echo TASKBENCH-PROBE*)`
-plus `"taskbenchProbe": "BEGIN TASKBENCH-PROBE"`. `#` comments are not valid
-in that file, so the marker is a JSON string. Cleanup removes that string
-and the allow entry, or restores the backup. It never deletes the file.
+Stop taskbench. `-Cleanup` restores a live file from its backup only when
+the probe marker or the `Bash(echo TASKBENCH-PROBE*)` rule is still in that
+file, then renames the backup to `*.used` so a later cleanup cannot copy it
+again. If the marker and the rule are absent, cleanup leaves the live file
+and the backup alone. Then plant only the `.claude` rule. JSON has no
+comments. The planted rule is the exact string `Bash(echo TASKBENCH-PROBE*)`
+inside `permissions.allow`. Cleanup parses with `ConvertFrom-Json` and
+removes that string. It drops an allow array or a permissions object that
+is empty because this script added it. When `settings.json` did not exist
+before planting, the script writes `settings.json.taskbench-created`.
+Cleanup deletes `settings.json` only when that sidecar exists and the file
+contains nothing but the probe rule. A file that already existed is not
+deleted.
 
 ```powershell
 .\scripts\laptop-probe.ps1 -Cleanup
@@ -307,9 +323,12 @@ if ($source -notlike "*.cmd") {
 If that prints `Item 7 is N/A`, checklist item 7 is N/A. Do not fail the
 laptop test for an `.exe` install. If it prints that the source is a
 `grok.cmd` shim, point the runner at it. In `config.json`, set
-`runners.grok-build.executable` to `$source`. Leave `args_template` on the
-real Grok flags (`--prompt-file`, `{prompt_file}`, `--cwd`, `{project_dir}`),
-not the hang scenario. Restart taskbench from this window:
+`runners.grok-build.executable` to `$source`. Leave `args_template` on
+`--prompt-file` and `{prompt_file}`, not the hang scenario. Do not put
+`--cwd`, `-c`, or `--config` in `args_template`: taskbench sets the working
+directory itself and rejects those flags. The control command above still
+passes `--cwd` because that command is Grok directly, outside taskbench.
+Restart taskbench from this window:
 
 ```powershell
 python -m taskbench --config .\config.json
@@ -322,15 +341,18 @@ A .cmd Grok shim starts correctly when that task reaches done and
 ## Remove
 
 Run this even if an earlier step failed. It recomputes the profile paths.
-When a timestamped backup exists, it restores the live file from the oldest
-backup and leaves the backup in place. When no backup exists, it removes
-only the `# BEGIN TASKBENCH-PROBE` / `# END TASKBENCH-PROBE` block, or the
-planted JSON document, and it does not delete the file. A second run prints
-that the file already matches the backup, or that there were no planted
-lines, and does not delete it. The script also removes the probe folders
-`C:\taskbench-probe` and `$env:USERPROFILE\taskbench-probe`. It does not
-clear `XAI_API_KEY`, so a cleanup between the two plantings leaves the key
-in place. The confirm block below clears the key.
+It restores a file only when the probe marker or the rule is present, and
+then renames that backup to `*.used`. A backup is not reused. If nothing is
+planted, cleanup does not restore, so newer edits stay. When no backup
+exists, it removes only the `# BEGIN TASKBENCH-PROBE` / `# END TASKBENCH-PROBE`
+block, or the exact JSON allow string, and it does not delete a file that
+existed before the probe. A file the script created, recorded by
+`*.taskbench-created`, is deleted only when it contains nothing but the
+probe rule. A second run finds no probe marker and does not write the file.
+The script also removes the probe folders `C:\taskbench-probe` and
+`$env:USERPROFILE\taskbench-probe`. It does not clear `XAI_API_KEY`, so a
+cleanup between the two plantings leaves the key in place. The confirm
+block below clears the key.
 
 ```powershell
 .\scripts\laptop-probe.ps1 -Cleanup -DryRun
@@ -350,9 +372,11 @@ Remove-Item Env:\XAI_API_KEY -ErrorAction SilentlyContinue
 
 `Select-String` must print nothing. Both probe folders must be gone.
 `$env:XAI_API_KEY` must be empty. The live `config.toml` and `settings.json`
-must still exist when they existed before the probe. The timestamped
-`*.taskbench-backup-*` files are the originals. After you have compared them
-to the live files, you may delete only those backup files:
+must still exist when they existed before the probe. If the script created
+one of them, that file is gone and so is its `.taskbench-created` sidecar.
+Retired backups end in `.used`. After you have compared them to the live
+files, you may delete only the backup files, including retired `.used`
+copies:
 
 ```powershell
 $grokDir = Join-Path $env:USERPROFILE ".grok"

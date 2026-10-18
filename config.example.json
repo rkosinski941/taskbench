@@ -21,9 +21,7 @@
         "--output-format",
         "streaming-messages-json",
         "--prompt-file",
-        "{prompt_file}",
-        "--cwd",
-        "{project_dir}"
+        "{prompt_file}"
       ],
       "can_ask": false,
       "sandbox_only": false
