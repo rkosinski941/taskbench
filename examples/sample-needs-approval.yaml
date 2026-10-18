@@ -1,0 +1,48 @@
+schema: joy-feeder.task/v2
+id: oj-sample-approval-001
+created: 2026-10-17T18:10:00-04:00
+from: Odd Jobs
+runner:
+  requested: opencode
+  actual: null        # written by the runner
+model:
+  requested: example-small-model
+  actual: null        # written by the runner
+project: demo-canvas
+# workdir: "C:/src/demo-canvas"  # optional absolute folder. S (trust: W).
+# A new path from web-ui is registered. A bot path must already be registered,
+# or the task goes to needs-approval (shown as Needs you). A rejected path
+# is blocked with reason "invalid workdir". This sample leaves workdir unset.
+permissions: ask      # every write and command raises an approval
+timeout_s: 900
+goal: >
+  In canvas-v2.html, change the caption text to "Hello, canvas." Then start
+  a local preview so the change can be checked in a browser, and stop it
+  before finishing.
+constraints:
+  - Edit only canvas-v2.html
+  - Preview must bind to 127.0.0.1 only
+  - Stop the preview server before reporting done
+success_criteria:
+  - The caption reads "Hello, canvas."
+  - The edit raised one approval and the preview raised another
+  - No process from this run is left running afterwards
+return:
+  path: outbox/odd-jobs/done/
+  notify: none
+priority: low
+due: null
+files:
+  - canvas-v2.html
+# Expected approvals (for testing): 1) the file edit, 2) the preview server,
+# e.g. "python -m http.server 8000 --bind 127.0.0.1"
+review_by:
+  runner: grok-build
+  model: null
+  permissions: plan
+status: incoming
+claimed_by: null
+claimed_at: null
+worker_thread: null
+retro: null
+result: null

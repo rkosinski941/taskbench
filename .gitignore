@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+var/
+test-scratch/
+config.json
+*.log
