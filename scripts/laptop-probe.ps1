@@ -175,7 +175,7 @@ function Invoke-ProbePlant {
 
 function Remove-MarkerBlock {
     param([string] $Text)
-    $pattern = '(?s)# BEGIN TASKBENCH-PROBE\r?\n.*?# END TASKBENCH-PROBE\r?\n?'
+    $pattern = '(?s)# BEGIN TASKBENCH-PROBE\r*\n.*?# END TASKBENCH-PROBE\r*\n?'
     return [regex]::Replace($Text, $pattern, "")
 }
 

@@ -342,8 +342,9 @@ class LaptopProbeScriptTests(unittest.TestCase):
         self.assertEqual(live.read_text(encoding="utf-8"), original)
         backups[0].unlink()
         live.write_text(
-            "# BEGIN TASKBENCH-PROBE\r\n[permission]\r\nallow = [\"Bash(echo TASKBENCH-PROBE*)\"]\r\n# END TASKBENCH-PROBE\r\n",
+            "# BEGIN TASKBENCH-PROBE\n[permission]\nallow = [\"Bash(echo TASKBENCH-PROBE*)\"]\n# END TASKBENCH-PROBE\n",
             encoding="utf-8",
+            newline="\n",
         )
         stripped = run("-Cleanup")
         self.assertEqual(stripped.returncode, 0, stripped.stderr)
