@@ -93,6 +93,8 @@ def compose_prompt(
     parts.append(f"# Task {packet.get('id', '')}\n")
     parts.append(f"From: {packet.get('from', '')}\n")
     parts.append(f"Project: {packet.get('project', '')}\n")
+    if isinstance(packet.get("workdir"), str) and packet["workdir"].strip():
+        parts.append(f"Folder: {packet['workdir'].strip()}\n")
     parts.append(f"Permissions: {packet.get('permissions', 'ask')}\n")
     parts.append(
         "\nRead `.taskbench/LAST_AGENT.md` if it exists before you act. "

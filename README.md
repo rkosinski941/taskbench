@@ -62,17 +62,49 @@ can still answer; the dead process group is killed first.
   `127.0.0.1` or `localhost` (with the port), plus names listed in
   `allowed_hosts` (empty by default). POST checks a per-session CSRF cookie.
 - Grok Build is pinned to `--permission-mode dontAsk` and `--sandbox strict`.
-  `can_ask` defaults to false, so `ask` and `allow-list` packets are blocked
-  before the process starts. `--always-approve`, `--yolo`, `--allow`,
-  `--auto-approve`, and any other permission flag are rejected. If the
-  running process reports a different mode or sandbox, taskbench kills it
-  and marks the packet `failed`.
-- The runner's environment is an allow-list (`PATH`, `HOME`, locale, and a
-  few Windows system variables). `GROK_*`, `PYTHONPATH`, `XDG_CONFIG_HOME`,
-  and similar config-home overrides are not passed through.
+  Those flags are placed immediately after the executable. A later copy is
+  removed. `--` (end of options) is rejected in `args_template` and in the
+  built argv. `can_ask` defaults to false, so `ask` and `allow-list` packets
+  are blocked before the process starts. `--always-approve`, `--yolo`,
+  `--allow`, `--auto-approve`, and any other permission flag are rejected.
+- Mode detection is best-effort. The real Grok CLI does not emit
+  `TASKBENCH` permission lines. The review named an init `permissionMode`
+  and did not include a captured line, so taskbench does not guess from
+  ordinary stdout. A run that never reports a mode is not proof of
+  `dontAsk`. If a structured event does report another mode or sandbox,
+  taskbench kills the process and marks the packet `failed`. On Linux,
+  `/proc` is checked only to confirm the argv taskbench launched. That
+  check does not exist on Windows.
+- Before each run, taskbench scans the project for `.grok/config.toml`,
+  `.claude/settings.json`, and `.claude/settings.local.json`, including
+  nested directories. A non-empty `allow`, a true `yolo` / `always-approve`
+  / `auto-approve` / `bypassPermissions`, or a `permission_mode` /
+  `defaultMode` other than `dontAsk` blocks the task. The status stays
+  `blocked`. The page shows **Needs you** and names the file and the rule
+  keys, not the rule values. Deny-only files still run. On Linux, user-level
+  `~/.grok` is not replaced, because `--sandbox strict` is the OS boundary
+  there. `--permission-mode dontAsk` overrides a config `permission_mode`
+  or `yolo`, but an explicit allow rule in the user config can still
+  auto-approve inside that sandbox. `/etc/grok` cannot be redirected.
+- Windows has no OS sandbox. Grok's `--sandbox strict` is Landlock and
+  Seatbelt only, and the CLI continues when it cannot apply a sandbox.
+  taskbench still runs on Windows. It shows `No OS sandbox on Windows; only taskbench approvals protect you`
+  on the page and as the first line of each run's output file. For each
+  Grok launch it recreates an empty `var/grok-home` and sets `HOME`,
+  `USERPROFILE`, and `GROK_HOME` to that directory (and `HOMEDRIVE` /
+  `HOMEPATH` when the path has a drive). The review names `HOME` and
+  `USERPROFILE` as the variables that select `~/.grok` and `~/.claude`.
+- The runner and any sidecar share an environment allow-list (`PATH`,
+  locale, and a few Windows system variables). `GROK_*`, `PYTHONPATH`,
+  `XDG_CONFIG_HOME`, and similar parent overrides are not passed through.
+  A sidecar does not inherit the parent environment. On Windows the empty
+  grok home is applied only to the Grok process, not to the sidecar.
 - If the Windows job object or the POSIX process group cannot be set up,
   the task is `failed` and nothing is left running. A sidecar that cannot
   join that same job or group is killed instead of being left unconfined.
+  A `grok.cmd` or `.bat` shim is started as `cmd.exe /d /s /c` with a
+  quoted argument list. taskbench does not use `shell=True`. An argument
+  that contains a cmd metacharacter is refused.
 - There is no config key or CLI flag for bypass, yolo, or auto-approve.
   Runner argument templates that contain those words are rejected.
 - Cancel, timeout, a normal exit, a failure, and watcher shutdown kill the
@@ -96,12 +128,13 @@ v1 implements the Grok Build adapter. Antigravity and opencode are stubs:
 packets that request them are `blocked` and the process is not started.
 
 Set `executable` and `args_template` yourself. Placeholders are
-`{prompt_file}`, `{project_dir}`, and `{timeout_s}`. taskbench appends
-`--permission-mode dontAsk` and `--sandbox strict` when the template does
-not already pin them, and it refuses other permission flags. The child gets
-`TASKBENCH_APPROVALS=1` and no other taskbench or Grok variables from the
-parent. `~/.grok` can still exist on disk; the pinned flags are what stop
-an unattended run from inheriting always-approve or a CLI `--allow` rule.
+`{prompt_file}`, `{project_dir}`, and `{timeout_s}`. taskbench puts
+`--permission-mode dontAsk` and `--sandbox strict` first, after the
+executable, and refuses other permission flags and `--`. The child gets
+`TASKBENCH_APPROVALS=1` and no Grok variables from the parent. On Windows
+those config-dir variables are then set to the empty grok home. The real
+CLI does not speak the permission lines in the protocol below; that check
+is best-effort only.
 
 Assumed stdout protocol, one JSON object per line, prefixed with `TASKBENCH `:
 
@@ -175,21 +208,21 @@ and this setup refuses that.
    powershell -File scripts/install.ps1 -WithTailscale
    ```
 
-   `-WithTailscale` prints the winget command first, then installs Tailscale
-   with `winget install --id Tailscale.Tailscale -e --scope user` if
-   `tailscale` is not already on `PATH`. Per-user scope is requested. The
-   Windows package still installs a system service, so winget may show a UAC
-   prompt. The script does not elevate itself. If admin rights are required,
-   re-run it from an elevated PowerShell. It then runs `tailscale serve` for
-   the port in the config so the page is reachable on the tailnet.
+   `-WithTailscale` prints two winget commands if `tailscale` is not on
+   `PATH`. It tries `winget install --id Tailscale.Tailscale -e --scope user`
+   first. If that fails, it retries the same install without `--scope user`
+   and says an administrator is required. The script does not elevate
+   itself and does not call `Start-Process -Verb RunAs`. It then runs
+   `tailscale serve` for the port in the config so the page is reachable
+   on the tailnet.
 4. The script reads `tailscale serve status`, `tailscale serve status --json`,
-   and `tailscale funnel status`. Funnel is on when the text says `Funnel on`
-   or `Available on the internet`, or when the JSON has a truthy Funnel /
-   AllowFunnel value. Unreadable JSON fails closed (treated as on). If Funnel
-   is on, the script says so, runs `tailscale funnel off`, checks again, and
-   exits with an error if Funnel is still on. It never runs a command that
-   turns Funnel on. Running the script again is safe: an existing per-user
-   install and an existing serve rule for the same port are left in place.
+   and `tailscale funnel status`. A single Funnel that is tied to
+   `127.0.0.1:<port>` is turned off with `tailscale funnel --https=443 off`
+   only. A Funnel for a different service, or more than one Funnel, stops
+   the script and is left alone. Not logged in, or an unreadable status, is
+   not reported as "FUNNEL IS ON". The port match does not treat `:87650`
+   as `:8765`. The script never turns Funnel on. Running it again is safe:
+   an existing serve rule for the same port is left in place.
 5. Put the machine's tailnet hostname in `allowed_hosts` and restart
    taskbench. The Host check then accepts that name in addition to
    `127.0.0.1` and `localhost`. CSRF is unchanged. `tailscale status --json`
@@ -206,6 +239,34 @@ and this setup refuses that.
 If the computer should keep running while it is plugged in, set sleep to
 never on AC power: Settings > System > Power, or
 `powercfg /change standby-timeout-ac 0`.
+
+## Working directory
+
+`project` stays a short name. Optional `workdir` is an absolute folder for
+that one task. When it is set, it is the root for the allow-list, for
+`INSTRUCTIONS.md`, for `.taskbench/LAST_AGENT.md`, and for the project
+allow-rule scan. The page shows the resolved path on the task and in the
+approval prompt.
+
+The folder field lists recent folders and accepts a typed path. On a
+loopback page, Browse opens a local folder dialog when tkinter is
+available. That control is not shown for a tailnet Host, and the picker
+route refuses any host that is not `127.0.0.1` or `localhost`.
+
+Symlinks and Windows junctions are resolved with `os.path.realpath` before
+the path is accepted. Missing paths, files, drive roots, the user profile
+root itself, and system folders are rejected. System folders include
+`Windows`, `System32`, `Program Files`, `Program Files (x86)`, and
+`ProgramData` on Windows, and `/`, `/etc`, `/usr`, `/bin`, and `/System`
+on POSIX.
+
+A task with `from: web-ui` may use a new valid folder. taskbench stores
+the resolved path in its data directory (`workdir-registry.json`), not in
+the repo. Any other sender may use only a folder already in that registry.
+An unregistered bot path is `blocked`, shown as **Needs you**, with the
+resolved path in the message, and it is not added to the registry.
+
+See `docs/SPEC-ADDITIONS.md`.
 
 ## v2
 

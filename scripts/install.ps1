@@ -56,21 +56,61 @@ function Write-ExpectedFunnelCheck {
     }
 }
 
-function Invoke-FunnelCheck {
+function Get-TailscaleOutput {
+    param([string[]] $TailArgs)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & tailscale @TailArgs 2>&1 | Out-String
+        return $output
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+function Get-FunnelKindFallback {
     param(
         [string] $ServeText,
         [string] $ServeJson,
-        [string] $FunnelText
+        [string] $FunnelText,
+        [int] $Port
     )
-    # -WhatIf must not skip the read-only check or leak PYTHONPATH into this session.
+    $combined = "$ServeText`n$FunnelText`n$ServeJson"
+    if ($combined -match '(?i)logged out|not logged in|tailscale is stopped|failed to connect to local tailscale|needs login') {
+        return "not-logged-in"
+    }
+    $trimmed = "$ServeJson".Trim()
+    if ($trimmed) {
+        try { $null = $trimmed | ConvertFrom-Json } catch { return "unreadable" }
+    }
+    $funnelHits = [regex]::Matches($combined, '(?i)funnel on')
+    $internet = $combined -match '(?i)available on the internet'
+    $allow = $trimmed -match '(?i)"[^"]*funnel[^"]*"\s*:\s*(true|\{)'
+    $on = ($funnelHits.Count -gt 0) -or $internet -or $allow
+    if (-not $on) { return "off" }
+    if ($funnelHits.Count -gt 1) { return "unrelated" }
+    $portRx = "127\.0\.0\.1:$Port(?!\d)"
+    $nearPort = $false
+    foreach ($line in ($ServeText + "`n" + $FunnelText).Split("`n")) {
+        if ($line -match '(?i)funnel' -and $line -match $portRx) { $nearPort = $true }
+    }
+    if ($funnelHits.Count -eq 1 -and $nearPort) { return "on-scoped" }
+    return "unrelated"
+}
+
+function Invoke-FunnelPlan {
+    param(
+        [string] $ServeText,
+        [string] $ServeJson,
+        [string] $FunnelText,
+        [int] $Port
+    )
     $savedWhatIf = $WhatIfPreference
     $WhatIfPreference = $false
     $savedPythonPath = [System.Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
     try {
         $py = Get-Command python -ErrorAction SilentlyContinue
-        if (-not $py) {
-            $py = Get-Command python3 -ErrorAction SilentlyContinue
-        }
+        if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
         if ($py) {
             $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("taskbench-funnel-" + [guid]::NewGuid().ToString("n"))
             [System.IO.Directory]::CreateDirectory($dir) | Out-Null
@@ -85,19 +125,21 @@ function Invoke-FunnelCheck {
                 $code = @"
 from pathlib import Path
 import sys
-from taskbench.funnel_check import funnel_is_on
-on = funnel_is_on(
+from taskbench.funnel_check import funnel_plan
+plan = funnel_plan(
     serve_text=Path(sys.argv[1]).read_text(encoding="utf-8"),
     serve_json=Path(sys.argv[2]).read_text(encoding="utf-8"),
     funnel_text=Path(sys.argv[3]).read_text(encoding="utf-8"),
+    port=int(sys.argv[4]),
 )
-print("on" if on else "off")
+print(plan["kind"])
 "@
-                $result = & $py.Source -c $code $serveFile $jsonFile $funnelFile
-                if ($LASTEXITCODE -eq 0 -and ($result -eq "on" -or $result -eq "off")) {
-                    return ($result -eq "on")
+                $result = & $py.Source -c $code $serveFile $jsonFile $funnelFile "$Port"
+                $kind = "$result".Trim()
+                if ($LASTEXITCODE -eq 0 -and $kind -in @("off", "on-scoped", "unrelated", "not-logged-in", "unreadable")) {
+                    return $kind
                 }
-                Write-Step "Python funnel check failed. Falling back to the same text rules."
+                Write-Step "Python funnel plan failed. Falling back to the same text rules."
             } finally {
                 [System.IO.Directory]::Delete($dir, $true)
             }
@@ -106,34 +148,7 @@ print("on" if on else "off")
         [System.Environment]::SetEnvironmentVariable("PYTHONPATH", $savedPythonPath, "Process")
         $WhatIfPreference = $savedWhatIf
     }
-    $combined = "$ServeText`n$FunnelText"
-    if ($combined -match '(?i)funnel on|available on the internet') {
-        return $true
-    }
-    $trimmed = "$ServeJson".Trim()
-    if ($trimmed) {
-        try {
-            $null = $trimmed | ConvertFrom-Json
-        } catch {
-            return $true
-        }
-        if ($trimmed -match '(?i)"[^"]*funnel[^"]*"\s*:\s*(true|\{[^{}]*[^{}\s])') {
-            return $true
-        }
-    }
-    return $false
-}
-
-function Get-TailscaleOutput {
-    param([string[]] $TailArgs)
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $output = & tailscale @TailArgs 2>&1 | Out-String
-        return $output
-    } finally {
-        $ErrorActionPreference = $previous
-    }
+    return Get-FunnelKindFallback -ServeText $ServeText -ServeJson $ServeJson -FunnelText $FunnelText -Port $Port
 }
 
 if (-not $WithTailscale) {
@@ -157,13 +172,14 @@ Write-Step "taskbench port from config: $port (listener stays 127.0.0.1)."
 
 $existing = Get-Command tailscale -ErrorAction SilentlyContinue
 if (-not $existing) {
-    $wingetCmd = "winget install --id Tailscale.Tailscale -e --scope user --accept-package-agreements --accept-source-agreements"
-    Write-Step "Command: $wingetCmd"
+    $userWinget = "winget install --id Tailscale.Tailscale -e --scope user --accept-package-agreements --accept-source-agreements"
+    $machineWinget = "winget install --id Tailscale.Tailscale -e --accept-package-agreements --accept-source-agreements"
+    Write-Step "Command: $userWinget"
+    Write-Step "If that package has no per-user installer, the retry is: $machineWinget"
     Write-Step "Per-user scope is requested first. Tailscale's Windows package installs a system service (the VPN driver)."
-    Write-Step "If winget says an administrator is required, approve the UAC prompt or re-run this script from an elevated PowerShell."
-    Write-Step "This script does not elevate itself and does not call Start-Process -Verb RunAs."
-    if (-not $PSCmdlet.ShouldProcess("Tailscale.Tailscale", "winget install --scope user")) {
-        Write-Step "WhatIf: skipped winget, tailscale serve, and any Funnel change."
+    Write-Step "The retry needs an administrator (UAC). This script does not elevate itself and does not call Start-Process -Verb RunAs."
+    if (-not $PSCmdlet.ShouldProcess("Tailscale.Tailscale", "winget install")) {
+        Write-Step "WhatIf: skipped both winget commands, tailscale serve, and any Funnel change."
         Write-ExpectedFunnelCheck -Port $port -Executed $false
         exit 0
     }
@@ -172,7 +188,14 @@ if (-not $existing) {
     }
     & winget install --id Tailscale.Tailscale -e --scope user --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) {
-        throw "winget install failed (exit $LASTEXITCODE). If the message asked for administrator rights, re-run from an elevated PowerShell. This script will not turn Funnel on."
+        Write-Step "winget --scope user failed (exit $LASTEXITCODE). Retrying without --scope user. An administrator is required. This script will not elevate."
+        if (-not $PSCmdlet.ShouldProcess("Tailscale.Tailscale", "winget install without --scope user")) {
+            throw "winget --scope user failed and the unscoped retry was not approved. This script does not elevate."
+        }
+        & winget install --id Tailscale.Tailscale -e --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -ne 0) {
+            throw "winget install failed (exit $LASTEXITCODE). Re-run from an elevated PowerShell if Windows asked for administrator rights. This script does not elevate and will not turn Funnel on."
+        }
     }
 } else {
     Write-Step "Tailscale is already on PATH. Skipping winget."
@@ -185,29 +208,40 @@ if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
 $serveText = Get-TailscaleOutput -TailArgs @("serve", "status")
 $serveJson = Get-TailscaleOutput -TailArgs @("serve", "status", "--json")
 $funnelText = Get-TailscaleOutput -TailArgs @("funnel", "status")
-$funnelOn = Invoke-FunnelCheck -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText
-if ($funnelOn) {
-    Write-Step "FUNNEL IS ON. taskbench will not expose this page to the public internet."
-    Write-Step "Command: tailscale funnel off"
-    if (-not $PSCmdlet.ShouldProcess("Tailscale Funnel", "turn off")) {
-        Write-Step "WhatIf: Funnel is on. A real run would execute 'tailscale funnel off' and stop if it stayed on. No serve change was made."
+$funnelKind = Invoke-FunnelPlan -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText -Port $port
+if ($funnelKind -eq "not-logged-in") {
+    throw "Tailscale is not logged in or the local service is stopped. This is not a report that Funnel is on. Log in with tailscale login, then re-run."
+}
+if ($funnelKind -eq "unreadable") {
+    throw "Funnel status could not be read. Refusing to continue. This is not a report that Funnel is on."
+}
+if ($funnelKind -eq "unrelated") {
+    throw "Funnel is on for a service other than 127.0.0.1:${port}, or more than one Funnel is configured. This script will not turn unrelated Funnels off."
+}
+if ($funnelKind -eq "on-scoped") {
+    Write-Step "FUNNEL IS ON for 127.0.0.1:${port}. taskbench will not expose this page to the public internet."
+    $offCmd = "tailscale funnel --https=443 off"
+    Write-Step "Command: $offCmd"
+    if (-not $PSCmdlet.ShouldProcess("Tailscale Funnel for 127.0.0.1:${port}", "tailscale funnel --https=443 off")) {
+        Write-Step "WhatIf: a real run would execute 'tailscale funnel --https=443 off' and stop if Funnel stayed on for this port. No global funnel off. No serve change was made."
         exit 1
     }
-    & tailscale funnel off
+    & tailscale funnel --https=443 off
     if ($LASTEXITCODE -ne 0) {
-        Write-Step "tailscale funnel off failed. Retrying: tailscale funnel --https=443 off"
-        & tailscale funnel --https=443 off
+        throw "tailscale funnel --https=443 off failed (exit $LASTEXITCODE). Refusing to continue. Unrelated Funnels were not changed."
     }
     $serveText = Get-TailscaleOutput -TailArgs @("serve", "status")
     $serveJson = Get-TailscaleOutput -TailArgs @("serve", "status", "--json")
     $funnelText = Get-TailscaleOutput -TailArgs @("funnel", "status")
-    if (Invoke-FunnelCheck -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText) {
-        throw "Funnel is still on after turning it off. Refusing to leave taskbench published. Turn Funnel off in the Tailscale admin console and re-run."
+    $funnelKind = Invoke-FunnelPlan -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText -Port $port
+    if ($funnelKind -ne "off") {
+        throw "Funnel is still not off for 127.0.0.1:${port} ($funnelKind). This script did not run a global funnel off. Turn this Funnel off in the Tailscale admin console and re-run."
     }
-    Write-Step "Funnel is now off."
+    Write-Step "Funnel is now off for 127.0.0.1:${port}."
 }
 
-$already = ($serveText -match "127\.0\.0\.1:$port") -or ($serveJson -match "127\.0\.0\.1:$port")
+$portPattern = "127\.0\.0\.1:${port}(?!\d)"
+$already = ($serveText -match $portPattern) -or ($serveJson -match $portPattern)
 if ($already) {
     Write-Step "tailscale serve already proxies 127.0.0.1:${port}. Not changing it."
 } else {
@@ -230,16 +264,27 @@ if ($already) {
 $serveText = Get-TailscaleOutput -TailArgs @("serve", "status")
 $serveJson = Get-TailscaleOutput -TailArgs @("serve", "status", "--json")
 $funnelText = Get-TailscaleOutput -TailArgs @("funnel", "status")
-if (Invoke-FunnelCheck -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText) {
-    Write-Step "FUNNEL IS ON after serve. Turning it off."
-    if ($PSCmdlet.ShouldProcess("Tailscale Funnel", "turn off after serve")) {
-        & tailscale funnel off
+$funnelKind = Invoke-FunnelPlan -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText -Port $port
+if ($funnelKind -eq "not-logged-in") {
+    throw "Tailscale is not logged in after serve. This is not a report that Funnel is on."
+}
+if ($funnelKind -eq "unreadable") {
+    throw "Funnel status could not be read after serve. This is not a report that Funnel is on."
+}
+if ($funnelKind -eq "unrelated") {
+    throw "Funnel is on for a service other than 127.0.0.1:${port} after serve. This script will not turn unrelated Funnels off."
+}
+if ($funnelKind -eq "on-scoped") {
+    Write-Step "FUNNEL IS ON for 127.0.0.1:${port} after serve."
+    if ($PSCmdlet.ShouldProcess("Tailscale Funnel for 127.0.0.1:${port}", "tailscale funnel --https=443 off")) {
+        & tailscale funnel --https=443 off
     }
     $serveText = Get-TailscaleOutput -TailArgs @("serve", "status")
     $serveJson = Get-TailscaleOutput -TailArgs @("serve", "status", "--json")
     $funnelText = Get-TailscaleOutput -TailArgs @("funnel", "status")
-    if (Invoke-FunnelCheck -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText) {
-        throw "Funnel is still on. taskbench stays loopback-only until Funnel is off."
+    $funnelKind = Invoke-FunnelPlan -ServeText $serveText -ServeJson $serveJson -FunnelText $funnelText -Port $port
+    if ($funnelKind -ne "off") {
+        throw "Funnel is still not off for 127.0.0.1:${port}. This script did not run a global funnel off."
     }
 }
 

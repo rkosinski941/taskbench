@@ -21,7 +21,15 @@ from typing import Any
 from taskbench.adapters import get_adapter
 from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import Config
-from taskbench.permissions import unexpected_permission
+from taskbench.permissions import (
+    needs_you_message,
+    prefix_output,
+    prepare_grok_config_home,
+    scan_project_permission_rules,
+    scrub_environment,
+    unexpected_permission,
+    windows_sandbox_banner,
+)
 from taskbench.process_tree import (
     ManagedProcess,
     ProcessTreeError,
@@ -40,6 +48,7 @@ from taskbench.projects import (
     retro_followup_prompt,
     write_last_agent,
 )
+from taskbench.workdir import WorkdirError, is_registered, register_workdir, validate_workdir
 from taskbench.safety import (
     classify,
     execute_readonly,
@@ -152,7 +161,7 @@ class Watcher:
             packet = interpreted.packet
             if not interpreted.ok:
                 # Outbox first, then drop the inbox file, so a crash cannot lose it.
-                self.store.publish_terminal_files(
+                self._publish(
                     packet,
                     self.store.read_output(str(packet["id"])) or f"{interpreted.reason}\n",
                 )
@@ -171,7 +180,7 @@ class Watcher:
                     "blocked_reason": f"duplicate id {packet_id}",
                     "completed_at": now_iso(),
                 }
-                self.store.publish_terminal_files(packet, f"duplicate id {packet_id}\n")
+                self._publish(packet, f"duplicate id {packet_id}\n")
                 path.unlink(missing_ok=True)
                 self.store.log(f"{packet['id']} -> blocked (duplicate id {packet_id})")
                 self._write_handoff(packet, f"duplicate id {packet_id}")
@@ -199,18 +208,21 @@ class Watcher:
         result["completed_at"] = now_iso()
         packet["result"] = result
         packet["retro"] = None
-        self.store.publish_terminal_files(packet, self.store.read_output(str(packet["id"])) or f"{reason}\n")
+        self._publish(packet, self.store.read_output(str(packet["id"])) or f"{reason}\n")
         self.store.log(f"{packet['id']} -> blocked ({reason})")
         self._write_handoff(packet, reason)
+
+    def _publish(self, packet: dict[str, Any], output: str) -> None:
+        self.store.publish_terminal_files(packet, prefix_output(output))
 
     # Start -----------------------------------------------------------------
 
     def _start(self, packet: dict[str, Any]) -> str:
         packet_id = str(packet["id"])
-        folder = project_dir(self.config.projects_dir, str(packet.get("project") or ""))
-        if not folder.is_dir():
-            packet["status"] = "blocked"
-            self._publish_blocked(packet, "unknown project")
+        try:
+            folder = self._resolve_run_folder(packet)
+        except WorkdirError as exc:
+            self._publish_blocked(packet, str(exc))
             return "blocked"
         requested = str((packet.get("runner") or {}).get("requested") or "")
         adapter = get_adapter(requested, self.config)
@@ -220,6 +232,10 @@ class Watcher:
             return "blocked"
         if permissions in {"ask", "allow-list"} and not adapter.can_ask:
             self._publish_blocked(packet, "runner cannot ask")
+            return "blocked"
+        findings = scan_project_permission_rules(folder)
+        if findings:
+            self._publish_blocked(packet, needs_you_message(findings))
             return "blocked"
         self.adapter = adapter
         previous = read_last_agent(folder)
@@ -247,7 +263,10 @@ class Watcher:
                 project_dir=folder,
                 timeout_s=timeout_s,
             )
-            env = adapter.environment(os.environ.copy())
+            config_home = None
+            if os.name == "nt" and adapter.name == "grok-build":
+                config_home = prepare_grok_config_home(self.config.data_dir)
+            env = adapter.environment(os.environ.copy(), config_home=config_home)
         except (NotImplementedError, ValueError) as exc:
             self._publish_blocked(packet, str(exc))
             return "blocked"
@@ -289,6 +308,9 @@ class Watcher:
             "decision": None,
         }
         self.store.write_meta(packet_id, meta)
+        banner = windows_sandbox_banner()
+        if banner:
+            self.store.append_output(packet_id, banner + "\n")
         self._note_pids()
         self.store.log(f"{packet_id} process {self.proc.pid} group {self.proc.group_id}")
         return self._pump()
@@ -350,6 +372,10 @@ class Watcher:
         return self._finish_exit(packet, code)
 
     def _observed_command_problem(self) -> str | None:
+        # Linux /proc only. This checks the argv taskbench launched, not a
+        # mode the CLI applied. read_cmdline returns None off Linux, so it
+        # is not a Windows backstop. Absence of a later report is not proof
+        # of dontAsk; see unexpected_permission.
         if self.run_state.get("cmdline_checked") or self.proc is None:
             return None
         self.run_state["cmdline_checked"] = True
@@ -516,7 +542,13 @@ class Watcher:
                     env = self.adapter.environment(os.environ.copy()) if self.adapter else os.environ.copy()
                     self.proc = ManagedProcess(shell_argv(command), folder, env)
                 else:
-                    self.proc.spawn_companion(shell_argv(command), folder)
+                    # Same allow-list as the runner. Do not pass the grok
+                    # config home and do not inherit the parent environment.
+                    self.proc.spawn_companion(
+                        shell_argv(command),
+                        folder,
+                        scrub_environment(os.environ.copy()),
+                    )
             except ProcessTreeError as exc:
                 self.run_state["fatal"] = (
                     f"refusing sidecar outside the process tree: {exc}"
@@ -712,7 +744,7 @@ class Watcher:
         if reason and status != "done":
             output += f"\n{reason}\n"
         output += f"status: {status}\n"
-        self.store.publish_terminal_files(packet, output)
+        self._publish(packet, output)
         self.store.log(f"{packet['id']} -> {status}" + (f" ({reason})" if reason else ""))
         self._write_handoff(packet, result["summary"] or reason or status)
         if status == "done":
@@ -743,7 +775,7 @@ class Watcher:
         packet["status"] = status
         output = self.store.read_output(str(packet["id"]))
         output += f"\n{reason}\nstatus: {status}\n"
-        self.store.publish_terminal_files(packet, output)
+        self._publish(packet, output)
         self.store.log(f"{packet['id']} -> {status} ({reason})")
         self._write_handoff(packet, reason)
 
@@ -764,7 +796,11 @@ class Watcher:
         meta = self.store.read_meta(packet_id)
         action = meta.get("pending_action") if isinstance(meta.get("pending_action"), dict) else {}
         command = str(meta.get("pending_command") or "")
-        folder = project_dir(self.config.projects_dir, str(packet.get("project") or ""))
+        try:
+            folder = self._resolve_run_folder(packet)
+        except WorkdirError as exc:
+            self._finish_without_process(packet, "blocked", str(exc), killed=True)
+            return "blocked"
         self.run_state = {
             "id": packet_id,
             "project": folder,
@@ -817,12 +853,59 @@ class Watcher:
             actual_model=str((packet.get("model") or {}).get("actual") or "") or None,
         )
 
-    def _write_handoff(self, packet: dict[str, Any], summary: str | None) -> None:
+    def _resolve_run_folder(self, packet: dict[str, Any]) -> Path:
+        """Project root for this packet.
+
+        A ``workdir`` is resolved before it is accepted. Bots cannot add a
+        folder to the registry. ``web-ui`` can. An unregistered bot path is
+        ``Needs you`` and is not stored as an accepted folder.
+        """
+        raw = packet.get("workdir")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                folder = validate_workdir(raw)
+            except WorkdirError as exc:
+                shown = exc.resolved or raw.strip()
+                if exc.resolved:
+                    packet["workdir"] = exc.resolved
+                raise WorkdirError(f"workdir rejected: {exc}: {shown}", exc.resolved) from exc
+            packet["workdir"] = str(folder)
+            sender = str(packet.get("from") or "")
+            if sender == "web-ui":
+                register_workdir(self.config.data_dir, folder)
+            elif not is_registered(self.config.data_dir, folder):
+                raise WorkdirError(
+                    "Needs you: workdir is not registered. "
+                    "Choose this folder in the web UI before a bot can use it: "
+                    + str(folder),
+                    str(folder),
+                )
+            return folder
+        folder = project_dir(self.config.projects_dir, str(packet.get("project") or ""))
+        if not folder.is_dir():
+            raise WorkdirError("unknown project")
+        return folder
+
+    def _handoff_folder(self, packet: dict[str, Any]) -> Path | None:
+        raw = packet.get("workdir")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                folder = validate_workdir(raw)
+            except WorkdirError:
+                return None
+            sender = str(packet.get("from") or "")
+            if sender != "web-ui" and not is_registered(self.config.data_dir, folder):
+                return None
+            return folder if folder.is_dir() else None
         project = packet.get("project")
         if not isinstance(project, str) or not project:
-            return
+            return None
         folder = project_dir(self.config.projects_dir, project)
-        if not folder.is_dir():
+        return folder if folder.is_dir() else None
+
+    def _write_handoff(self, packet: dict[str, Any], summary: str | None) -> None:
+        folder = self._handoff_folder(packet)
+        if folder is None:
             return
         runner = str((packet.get("runner") or {}).get("actual") or (packet.get("runner") or {}).get("requested") or "unknown")
         model = (packet.get("model") or {}).get("actual")
@@ -865,6 +948,8 @@ class Watcher:
             "retro": None,
             "result": None,
         }
+        if isinstance(packet.get("workdir"), str) and packet["workdir"].strip():
+            child["workdir"] = packet["workdir"]
         self.store.write_packet("inbox", child)
         result = dict(packet.get("result") or {})
         result["review_task"] = child_id

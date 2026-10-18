@@ -1,13 +1,20 @@
 """Grok Build adapter.
 
 ``args_template`` may use ``{prompt_file}``, ``{project_dir}``, and
-``{timeout_s}``. taskbench always appends ``--permission-mode dontAsk`` and
-``--sandbox strict`` when the template does not already pin them. Other
-permission flags (``--always-approve``, ``--allow``, ``--auto-approve``,
-``--yolo``, and unknown permission flags) are rejected. The child environment
-is an allow-list; ``GROK_*``, ``PYTHONPATH``, and config-home overrides are
-not passed through. ``can_ask`` defaults to false because ``dontAsk`` does
-not ask taskbench.
+``{timeout_s}``. taskbench places ``--permission-mode dontAsk`` and
+``--sandbox strict`` immediately after the executable and strips any later
+copy of those flags. ``--`` is rejected in the template and in the built
+argv. Other permission flags (``--always-approve``, ``--allow``,
+``--auto-approve``, ``--yolo``, and unknown permission flags) are rejected.
+The child environment is an allow-list. Parent ``GROK_*``, ``PYTHONPATH``,
+and config-home overrides are not passed through. On Windows the caller
+passes an empty config home and this adapter sets ``HOME``, ``USERPROFILE``,
+and ``GROK_HOME`` to it. ``can_ask`` defaults to false because ``dontAsk``
+does not ask taskbench.
+
+Permission-mode detection is best-effort. The real Grok CLI does not emit
+the ``TASKBENCH`` permission lines below. A missing line is not proof of
+``dontAsk``.
 
 Assumed stdout protocol, one JSON object per line::
 
@@ -34,7 +41,7 @@ from pathlib import Path
 
 from taskbench.adapters.base import Adapter
 from taskbench.config import RunnerConfig
-from taskbench.permissions import ensure_pinned_args
+from taskbench.permissions import apply_config_home, ensure_pinned_args
 
 
 class GrokBuildAdapter(Adapter):
@@ -63,3 +70,9 @@ class GrokBuildAdapter(Adapter):
                 arg = arg.replace(key, value)
             argv.append(arg)
         return ensure_pinned_args(argv)
+
+    def environment(self, base: dict[str, str], *, config_home: Path | None = None) -> dict[str, str]:
+        env = super().environment(base)
+        if config_home is not None:
+            env = apply_config_home(env, config_home)
+        return env

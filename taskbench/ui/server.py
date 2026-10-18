@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,10 +26,19 @@ from urllib.parse import parse_qs, urlparse
 from taskbench.atomic import atomic_write_text
 from taskbench.config import Config
 from taskbench.projects import now_iso
+from taskbench.permissions import windows_sandbox_banner
 from taskbench.safety import approval_title
 from taskbench.state import StateStore
 from taskbench.task_format import emit_yaml
 from taskbench.watcher import Watcher, queue_view
+from taskbench.workdir import (
+    WorkdirError,
+    display_folder,
+    is_registered,
+    load_registry,
+    register_workdir,
+    validate_workdir,
+)
 
 COOKIE = "taskbench_csrf"
 MAX_BODY = 2_000_000
@@ -101,7 +111,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/":
-            body = render_index(self.server.app, token, self._tailscale_user()).encode("utf-8")
+            query = parse_qs(parsed.query)
+            prefill = (query.get("workdir") or [""])[-1]
+            body = render_index(
+                self.server.app,
+                token,
+                self._tailscale_user(),
+                prefill_workdir=prefill,
+                local_picker=_loopback_host(self.headers.get("Host")),
+            ).encode("utf-8")
             self._send(200, "text/html; charset=utf-8", body, token if fresh else None)
             return
         if path.startswith("/task/"):
@@ -138,6 +156,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/tasks":
             self._create_task(form)
             return
+        if path == "/pick-folder":
+            self._pick_folder()
+            return
         if path.startswith("/task/") and path.endswith("/approve"):
             packet_id = path[len("/task/") : -len("/approve")].strip("/")
             self._decide(packet_id, "approved")
@@ -171,6 +192,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, "text/html; charset=utf-8", body, None)
             return
         timeout_s = int(timeout_raw) if timeout_raw else 900
+        workdir_raw = form.get("workdir", "").strip()
+        resolved_workdir = ""
+        if workdir_raw:
+            try:
+                chosen = validate_workdir(workdir_raw)
+            except WorkdirError as exc:
+                shown = exc.resolved or workdir_raw
+                message = f"workdir rejected: {exc}: {shown}"
+                body = f"<p>{html.escape(message)}</p><p><a href='/'>Back</a></p>".encode("utf-8")
+                self._send(400, "text/html; charset=utf-8", body, None)
+                return
+            register_workdir(self.server.app.config.data_dir, chosen)
+            resolved_workdir = str(chosen)
         packet: dict[str, Any] = {
             "schema": "joy-feeder.task/v2",
             "id": "web-" + secrets.token_hex(6),
@@ -186,11 +220,30 @@ class Handler(BaseHTTPRequestHandler):
             "retro": None,
             "result": None,
         }
+        if resolved_workdir:
+            packet["workdir"] = resolved_workdir
         if permissions == "allow-list":
             packet["allow"] = [line.strip() for line in allow_text.splitlines() if line.strip()]
         path = self.server.app.store.inbox / f"{packet['id']}.yaml"
         atomic_write_text(path, emit_yaml(packet))
         self._redirect()
+
+    def _pick_folder(self) -> None:
+        if not _loopback_host(self.headers.get("Host")):
+            self._send(403, "text/plain; charset=utf-8", b"folder picker is local only", None)
+            return
+        try:
+            chosen = pick_local_folder()
+        except WorkdirError as exc:
+            body = f"<p>{html.escape(str(exc))}</p><p><a href='/'>Back</a></p>".encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body, None)
+            return
+        if not chosen:
+            self._redirect()
+            return
+        from urllib.parse import quote
+
+        self._redirect(f"/?workdir={quote(chosen)}")
 
     def _decide(self, packet_id: str, decision: str) -> None:
         if not _safe_id(packet_id):
@@ -240,7 +293,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         from taskbench.safety import PathEscape, resolve_inside_project
 
-        folder = self.server.app.config.projects_dir / project
+        folder = _artifact_folder(self.server.app, packet, project)
+        if folder is None:
+            self._send(404, "text/plain; charset=utf-8", b"not found", None)
+            return
         try:
             path = resolve_inside_project(folder, relative)
         except PathEscape:
@@ -291,10 +347,12 @@ class Handler(BaseHTTPRequestHandler):
             return existing, False
         return secrets.token_urlsafe(32), True
 
-    def _redirect(self) -> None:
+    def _redirect(self, location: str = "/") -> None:
+        if not location.startswith("/") or location.startswith("//"):
+            location = "/"
         body = b"See other"
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", location)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -316,14 +374,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def render_index(app: App, token: str, tailscale_user: str | None) -> str:
+def render_index(
+    app: App,
+    token: str,
+    tailscale_user: str | None,
+    *,
+    prefill_workdir: str = "",
+    local_picker: bool = False,
+) -> str:
     packets = app.store.iter_packets()
     grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in _STATUS_ORDER}
     for _location, packet in packets:
         status = str(packet.get("status") or "")
         grouped.setdefault(status, []).append(packet)
     queue = {item["id"]: item for item in queue_view(app.store)}
-    parts = [_page_start(tailscale_user), _composer(app, token), ""]
+    parts = [
+        _page_start(tailscale_user),
+        _composer(app, token, prefill_workdir=prefill_workdir, local_picker=local_picker),
+        "",
+    ]
     for status in _STATUS_ORDER:
         parts.append(f"<section class='group' id='{status}'><h2>{html.escape(status)}</h2>")
         items = grouped.get(status) or []
@@ -346,7 +415,7 @@ def render_task(app: App, packet: dict[str, Any], token: str, tailscale_user: st
     return "".join(parts)
 
 
-def _composer(app: App, token: str) -> str:
+def _composer(app: App, token: str, *, prefill_workdir: str = "", local_picker: bool = False) -> str:
     projects = _projects(app.config)
     runners = list(app.config.runners)
     project_options = "".join(
@@ -367,10 +436,12 @@ def _composer(app: App, token: str) -> str:
         "<option value='allow-list'>allow-list</option>"
         "</select></label> "
         "<label>Timeout seconds <input name='timeout_s' value='900'></label>"
-        "<p><label>Allow patterns (allow-list only)<br>"
+        + _folder_field(app, prefill_workdir)
+        + "<p><label>Allow patterns (allow-list only)<br>"
         "<textarea name='allow' rows='3'></textarea></label></p>"
         "<p><label>Task<br><textarea name='goal' rows='8' required></textarea></label></p>"
         "<button type='submit'>Queue task</button></form>"
+        + _picker_form(local_picker, token)
     )
 
 
@@ -391,7 +462,8 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         f"<h3>{html.escape(packet_id)}</h3>",
         f"<p class='from'>From: {html.escape(sender)}</p>",
         f"<p>Project: {html.escape(project)}</p>",
-        f"<p>Status: {html.escape(status)}</p>",
+        _folder_line(app, packet),
+        f"<p>Status: {html.escape(_visible_status(status, _nested_result(packet, 'blocked_reason')))}</p>",
         "<p class='model'>requested <span data-model-requested='",
         html.escape("" if requested is None else str(requested)),
         "'>",
@@ -428,6 +500,7 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         diff = str(meta.get("pending_diff") or "")
         title = approval_title(command)
         parts.append(f"<h3 class='approval-title'>{html.escape(title)}</h3>")
+        parts.append(_folder_line(app, packet))
         parts.append(f"<pre class='command'>{html.escape(command)}</pre>")
         if diff:
             parts.append(f"<pre class='diff'>{html.escape(diff)}</pre>")
@@ -474,21 +547,122 @@ def _page_start(tailscale_user: str | None) -> str:
             + html.escape(tailscale_user)
             + "</p>"
         )
+    banner = windows_sandbox_banner()
+    banner_html = ""
+    if banner:
+        banner_html = f"<p class='sandbox-banner'>{html.escape(banner)}</p>"
     return (
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
         "<title>taskbench</title><style>"
         "body{font-family:sans-serif;margin:1.5rem;max-width:52rem}"
-        "textarea{width:100%;} .card{border:1px solid #ccc;padding:.75rem;margin:.5rem 0}"
+        "textarea,input[name=workdir]{width:100%;} .card{border:1px solid #ccc;padding:.75rem;margin:.5rem 0}"
         "pre.command,pre.diff{max-height:12rem;overflow:auto;white-space:pre-wrap;"
         "word-break:break-word;background:#f6f6f6;padding:.5rem}"
+        ".sandbox-banner{background:#fff3cd;padding:.5rem}"
         "</style></head><body><h1>taskbench</h1>"
         "<p>Local runner. Artifacts are files. There is no preview pane.</p>"
+        + banner_html
         + who
     )
 
 
 def _page_end() -> str:
     return "</body></html>"
+
+
+def _visible_status(status: str, reason: object) -> str:
+    if status == "blocked" and isinstance(reason, str) and reason.startswith("Needs you"):
+        return "Needs you"
+    return status
+
+
+def _folder_line(app: App, packet: dict[str, Any]) -> str:
+    folder = display_folder(packet, projects_dir=app.config.projects_dir)
+    if not folder:
+        return ""
+    return (
+        "<p class='workdir' data-workdir='"
+        + html.escape(folder)
+        + "'>Folder: "
+        + html.escape(folder)
+        + "</p>"
+    )
+
+
+def _folder_field(app: App, prefill: str) -> str:
+    options = []
+    for folder in load_registry(app.config.data_dir):
+        options.append(f"<option value='{html.escape(folder)}'></option>")
+    return (
+        "<p><label>Folder<br>"
+        f"<input name='workdir' list='recent-folders' value='{html.escape(prefill)}' "
+        "placeholder='Absolute path. Leave empty to use the project name.'>"
+        "</label></p>"
+        f"<datalist id='recent-folders'>{''.join(options)}</datalist>"
+    )
+
+
+def _picker_form(local_picker: bool, token: str) -> str:
+    if not local_picker:
+        return ""
+    return (
+        "<form method='post' action='/pick-folder'>"
+        f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
+        "<button type='submit'>Browse folders</button>"
+        "<p class='picker-note'>The folder picker runs only for a loopback page.</p></form>"
+    )
+
+
+def _artifact_folder(app: App, packet: dict[str, Any], project: str) -> Path | None:
+    raw = packet.get("workdir")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            folder = validate_workdir(raw)
+        except WorkdirError:
+            return None
+        if not is_registered(app.config.data_dir, folder):
+            return None
+        return folder
+    return app.config.projects_dir / project
+
+
+def _loopback_host(host_header: str | None) -> bool:
+    if not host_header:
+        return False
+    name = host_header.strip().split(",")[0].strip()
+    if name.startswith("["):
+        name = name.split("]")[0].strip("[")
+    else:
+        name = name.split(":")[0]
+    return name.lower() in {"127.0.0.1", "localhost"}
+
+
+def pick_local_folder() -> str | None:
+    """Open a native folder dialog on this machine.
+
+    There is no remote picker. Callers must already have refused every host
+    that is not loopback. A missing display or tkinter is a normal refusal.
+    """
+    if os.environ.get("TASKBENCH_DISABLE_FOLDER_PICKER") == "1":
+        raise WorkdirError("folder picker is not available on this machine")
+    if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise WorkdirError("folder picker is not available on this machine")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise WorkdirError("folder picker is not available on this machine") from exc
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        chosen = filedialog.askdirectory(mustexist=True)
+    except Exception as exc:
+        raise WorkdirError("folder picker is not available on this machine") from exc
+    finally:
+        root.destroy()
+    if not chosen:
+        return None
+    return str(chosen)
 
 
 def _not_found() -> bytes:

@@ -33,10 +33,15 @@ class Adapter(ABC):
     ) -> list[str]:
         """Return argv. The command must hand approvals to taskbench."""
 
-    def environment(self, base: dict[str, str]) -> dict[str, str]:
-        """Return the child environment. Parent variables are not passed through."""
+    def environment(self, base: dict[str, str], *, config_home: Path | None = None) -> dict[str, str]:
+        """Return the child environment. Parent variables are not passed through.
+
+        ``config_home`` is only applied by the Grok adapter, and only when
+        the caller passes the empty directory prepared for that run.
+        """
         from taskbench.permissions import scrub_environment
 
+        del config_home
         return scrub_environment(base)
 
     def parse_line(self, line: str) -> dict[str, Any] | None:

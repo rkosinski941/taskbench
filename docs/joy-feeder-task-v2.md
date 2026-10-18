@@ -26,6 +26,7 @@ Who writes each field: **S** = sender, **W** = watcher, **R** = runner adapter.
 | `model.requested` | string | no | S | e.g. `grok-4.7`. `null` = runner default. |
 | `model.actual` | string | no | **R** | The model id the runner reports for the run, not the UI label. |
 | `project` | string | yes | S | Folder name relative to the taskbench projects root, e.g. `demo-canvas`. **Never an absolute path**, no `..`, no drive letters. |
+| `workdir` | string | no | S | Optional absolute folder for this task. See `docs/SPEC-ADDITIONS.md`. When set, it replaces the project directory as the run root. |
 | `permissions` | enum | no | S | `plan` \| `ask` \| `allow-list`. **Default `ask`.** |
 | `allow` | list of strings | if `allow-list` | S | Command patterns that may run without a prompt (glob-style, matched against the full command line). Anything else still asks. |
 | `timeout_s` | integer | no | S | Wall-clock limit in seconds. Default 900. Max 7200. |

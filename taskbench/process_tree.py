@@ -17,7 +17,15 @@ and does not fall open to ``taskkill``.
 
 ``spawn_companion`` puts a server or other extra process in the same group
 or job. If it cannot join, it is killed and the call fails. Completion,
-cancel, timeout, and shutdown then kill whatever joined.
+cancel, timeout, and shutdown then kill whatever joined. A companion gets
+the environment the caller passes. When the caller omits it, the companion
+gets the same allow-list as a runner, not the parent process environment.
+
+Windows ``CreateProcessW`` only searches ``PATH`` for ``.exe`` when
+``lpApplicationName`` has no directory. A ``grok.cmd`` / ``.bat`` shim is
+launched as ``cmd.exe /d /s /c`` with a quoted argument list. That path
+does not use ``shell=True``. Arguments that contain cmd metacharacters
+are refused.
 """
 
 from __future__ import annotations
@@ -35,6 +43,84 @@ KILL_METHOD = "killpg" if os.name != "nt" else "job_object"
 
 class ProcessTreeError(RuntimeError):
     pass
+
+
+_CMD_META = set("&|<>^%!\r\n")
+
+
+def _companion_env(env: dict[str, str] | None) -> dict[str, str]:
+    """Allow-list when the caller did not pass an environment."""
+    from taskbench.permissions import scrub_environment
+
+    if env is None:
+        return scrub_environment(os.environ.copy())
+    return dict(env)
+
+
+def windows_process_command(
+    argv: list[str],
+    *,
+    path_env: str = "",
+    pathext: str = "",
+    comspec: str = "",
+    exists=None,
+) -> tuple[str | None, str]:
+    """``(lpApplicationName, lpCommandLine)`` for ``CreateProcessW``.
+
+    ``.cmd`` and ``.bat`` shims are started through ``cmd.exe /d /s /c``.
+    The command line is built with ``list2cmdline``. Tokens that contain
+    cmd metacharacters are refused so this cannot be used as ``shell=True``.
+    """
+    if not argv or not str(argv[0]).strip():
+        raise ProcessTreeError("empty argv")
+    probe = os.path.exists if exists is None else exists
+    resolved = _resolve_windows_executable(argv[0], path_env, pathext, probe)
+    target = resolved or argv[0]
+    suffix = os.path.splitext(target)[1].lower()
+    if suffix in {".cmd", ".bat"}:
+        shell = comspec.strip() or "cmd.exe"
+        launched = [target, *argv[1:]]
+        for arg in launched:
+            if any(char in arg for char in _CMD_META):
+                raise ProcessTreeError(
+                    "refusing .cmd/.bat launch: argument contains a cmd metacharacter"
+                )
+        inner = subprocess.list2cmdline(launched)
+        command_line = subprocess.list2cmdline([shell, "/d", "/s", "/c", inner])
+        application = shell if _win_dirname(shell) else None
+        return application, command_line
+    application = target if _win_dirname(target) else None
+    return application, subprocess.list2cmdline([target, *argv[1:]] if resolved else argv)
+
+
+def _win_dirname(path: str) -> str:
+    """Directory portion, treating both slash styles as separators."""
+    normalized = path.replace("/", "\\")
+    if "\\" not in normalized:
+        return ""
+    return normalized.rsplit("\\", 1)[0]
+
+
+def _resolve_windows_executable(name: str, path_env: str, pathext: str, exists) -> str | None:
+    if os.path.dirname(name):
+        return name
+    extensions = [item for item in pathext.split(";") if item] or [".COM", ".EXE", ".BAT", ".CMD"]
+    if os.path.splitext(name)[1]:
+        candidates = [name]
+    else:
+        candidates = [name + ext for ext in extensions]
+    for directory in path_env.split(";"):
+        if not directory:
+            continue
+        for candidate in candidates:
+            full = os.path.join(directory, candidate)
+            try:
+                found = bool(exists(full))
+            except OSError:
+                found = False
+            if found:
+                return full
+    return None
 
 
 def pid_alive(pid: int) -> bool:
@@ -157,9 +243,15 @@ class ManagedProcess:
                 found.add(companion.pid)
         return {pid for pid in found if pid > 0}
 
-    def spawn_companion(self, argv: list[str], cwd: Path) -> int:
+    def spawn_companion(
+        self,
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        child_env = _companion_env(env)
         if os.name == "nt":
-            return _win_spawn_companion(self, argv, cwd)
+            return _win_spawn_companion(self, argv, cwd, child_env)
         group = self._group_id
 
         def _join_group() -> None:
@@ -169,6 +261,7 @@ class ManagedProcess:
             proc = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
+                env=child_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -571,9 +664,14 @@ def _win_start(proc: ManagedProcess, argv: list[str], cwd: Path, env: dict[str, 
     startup.hStdOutput = stdout_write
     startup.hStdError = stderr_write
     process_info = process_type()
-    cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+    application, command_line = windows_process_command(
+        argv,
+        path_env=env.get("PATH", ""),
+        pathext=env.get("PATHEXT", ""),
+        comspec=env.get("COMSPEC", ""),
+    )
+    cmdline = ctypes.create_unicode_buffer(command_line)
     env_block = ctypes.create_unicode_buffer(_env_block(env))
-    application = argv[0] if os.path.dirname(argv[0]) else None
     flags = 0x00000004 | 0x00000400 | 0x08000000  # SUSPENDED | UNICODE_ENV | NO_WINDOW
     created = kernel32.CreateProcessW(
         application,
@@ -632,7 +730,12 @@ def _win_start(proc: ManagedProcess, argv: list[str], cwd: Path, env: dict[str, 
     proc._start_reader(stderr, "stderr")
 
 
-def _win_spawn_companion(owner: ManagedProcess, argv: list[str], cwd: Path) -> int:
+def _win_spawn_companion(
+    owner: ManagedProcess,
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+) -> int:
     import ctypes
     from ctypes import wintypes
 
@@ -641,9 +744,15 @@ def _win_spawn_companion(owner: ManagedProcess, argv: list[str], cwd: Path) -> i
     startup = startup_type()
     startup.cb = ctypes.sizeof(startup)
     process_info = process_type()
-    cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
-    flags = 0x00000004 | 0x08000000  # SUSPENDED | NO_WINDOW
-    application = argv[0] if os.path.dirname(argv[0]) else None
+    application, command_line = windows_process_command(
+        argv,
+        path_env=env.get("PATH", ""),
+        pathext=env.get("PATHEXT", ""),
+        comspec=env.get("COMSPEC", ""),
+    )
+    cmdline = ctypes.create_unicode_buffer(command_line)
+    env_block = ctypes.create_unicode_buffer(_env_block(env))
+    flags = 0x00000004 | 0x00000400 | 0x08000000  # SUSPENDED | UNICODE_ENV | NO_WINDOW
     if not kernel32.CreateProcessW(
         application,
         cmdline,
@@ -651,7 +760,7 @@ def _win_spawn_companion(owner: ManagedProcess, argv: list[str], cwd: Path) -> i
         None,
         False,
         flags,
-        None,
+        ctypes.cast(env_block, ctypes.c_void_p),
         str(cwd),
         ctypes.byref(startup),
         ctypes.byref(process_info),

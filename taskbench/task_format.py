@@ -19,6 +19,8 @@ Assumptions where the spec is silent are marked in the README. In short:
 * Unknown ``permissions`` values are stored as ``ask``.
 * ``from`` is rejected when it is empty or equal, ignoring case and surrounding
   space, to the configured human owner (default ``Rich``).
+* ``workdir``, when present, is a non-empty string. The watcher resolves it
+  and decides whether that folder may be used. See ``docs/SPEC-ADDITIONS.md``.
 """
 
 from __future__ import annotations
@@ -121,6 +123,11 @@ def interpret(data: Any, *, human_owner: str) -> InterpretedPacket:
     project = data.get("project")
     if not _valid_project(project):
         reasons.append("invalid project")
+
+    workdir = data.get("workdir", None)
+    if workdir is not None:
+        if not isinstance(workdir, str) or not workdir.strip() or "\x00" in workdir:
+            reasons.append("invalid workdir")
 
     runner = data.get("runner")
     requested = runner.get("requested") if isinstance(runner, dict) else None

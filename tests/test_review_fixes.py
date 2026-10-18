@@ -36,8 +36,10 @@ class PinnedPermissionTests(unittest.TestCase):
             project_dir=Path("."),
             timeout_s=30,
         )
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "strict")
+        self.assertEqual(
+            argv[:5],
+            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict"],
+        )
 
         omitted = _runner()
         self.assertFalse(omitted.can_ask)
@@ -46,9 +48,11 @@ class PinnedPermissionTests(unittest.TestCase):
             project_dir=Path("."),
             timeout_s=30,
         )
-        self.assertIn("--permission-mode", pinned)
-        self.assertEqual(pinned[pinned.index("--permission-mode") + 1], "dontAsk")
-        self.assertEqual(pinned[pinned.index("--sandbox") + 1], "strict")
+        self.assertEqual(
+            pinned[:5],
+            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict"],
+        )
+        self.assertEqual(pinned[5:7], ["--prompt-file", "prompt.md"])
 
     def test_banned_and_unknown_permission_flags_are_rejected(self) -> None:
         banned = [
@@ -210,6 +214,11 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn('$WhatIfPreference = $false', script)
         self.assertIn('SetEnvironmentVariable("PYTHONPATH", $savedPythonPath, "Process")', script)
         self.assertNotIn("$env:PYTHONPATH = $Root", script)
+        self.assertIn("--scope user", script)
+        self.assertIn("winget install --id Tailscale.Tailscale -e --accept-package-agreements", script)
+        self.assertIn("tailscale funnel --https=443 off", script)
+        self.assertNotIn("& tailscale funnel off\n", script)
+        self.assertIn("(?!\\d)", script)
 
 
 if __name__ == "__main__":
