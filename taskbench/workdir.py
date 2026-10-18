@@ -197,13 +197,30 @@ def _is_drive_root(text: str, platform: str) -> bool:
             parts = [part for part in normalized.split("\\") if part]
             return len(parts) <= 2
         return False
-    return os.path.normpath(text) == "/"
+    return _norm(text, "posix") == "/"
 
 
 def _norm(text: str, platform: str) -> str:
+    """Normalize for comparison without using the host's ``os.path``.
+
+    POSIX rules are string checks so they can be tested on Windows, where
+    ``os.path.normpath('/System')`` is not a POSIX path.
+    """
     if platform == "nt":
         return os.path.normcase(text.replace("/", "\\")).rstrip("\\")
-    return os.path.normpath(text)
+    parts: list[str] = []
+    absolute = text.startswith("/") or text.startswith("\\")
+    for part in text.replace("\\", "/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    if absolute:
+        return "/" + "/".join(parts)
+    return "/".join(parts)
 
 
 def _same(left: str, right: str, platform: str) -> bool:
