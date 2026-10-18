@@ -240,6 +240,21 @@ def main(argv: list[str] | None = None) -> int:
     prompt = read_prompt(args.prompt_file)
     marker = Path(args.marker_dir) if args.marker_dir else Path(".")
     scenario = args.scenario
+    # The retro follow-up is a new process with the same scenario name.
+    # Answer it here so an action scenario does not wait for a decision
+    # the follow-up loop never sends.
+    if "Retro follow-up" in prompt and scenario not in {"tree", "server", "hang", "exit-no-result", "sleeper"}:
+        emit_init(args.permission_mode)
+        emit(
+            {
+                "type": "retro",
+                "effort": "The follow-up.",
+                "unclear": "The score scale.",
+                "would_change": "Ask once.",
+                "fit_1_5": 3,
+            }
+        )
+        return 0
     if scenario == "sleeper":
         return scenario_sleeper(marker, args.role)
     if scenario == "bad-permission":

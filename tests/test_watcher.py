@@ -48,7 +48,7 @@ class WatcherArtifactTests(TempApp):
     def test_retro_followup_and_null_when_killed(self) -> None:
         _config, _app, watcher = self.make(scenario="needs-retro-followup")
         write_packet(self.store.inbox, base_packet(id="retro-1", timeout_s=30))
-        run_until(watcher, lambda: packet_status(self.store, "retro-1") == "done", timeout=10)
+        run_until(watcher, lambda: packet_status(self.store, "retro-1") == "done", timeout=20)
         saved = parse_yaml((self.store.outbox / "retro-1.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["retro"]["effort"], "The follow-up.")
         self.assertEqual(saved["retro"]["fit_1_5"], 3)

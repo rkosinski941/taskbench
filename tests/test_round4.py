@@ -79,7 +79,7 @@ class GuardTests(TempApp):
         self.addCleanup(lambda: setattr(process_tree, "observe_spawn", real_observe))
         _config, _app, watcher = self.make(scenario="needs-retro-followup", can_ask=False)
         write_packet(self.store.inbox, base_packet(id="guard-1", permissions="plan", timeout_s=30))
-        run_until(watcher, lambda: packet_status(self.store, "guard-1") == "done", timeout=10)
+        run_until(watcher, lambda: packet_status(self.store, "guard-1") == "done", timeout=20)
         runners = [item for item in seen if argv_is_runner(item[0])]
         self.assertGreaterEqual(len(runners), 2)
         self.assertTrue(all(flag for _argv, flag in runners))

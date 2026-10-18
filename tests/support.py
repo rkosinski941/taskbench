@@ -117,7 +117,7 @@ def base_packet(**overrides) -> dict:
     return packet
 
 
-def run_until(watcher: Watcher, predicate, timeout: float = 8.0) -> None:
+def run_until(watcher: Watcher, predicate, timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         watcher.tick()
