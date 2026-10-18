@@ -2,13 +2,20 @@
 
 Exact values (an ``auth.json`` field, ``XAI_API_KEY``, the one-time login
 token, the session secret, the CSRF token) are replaced when they are at
-least six characters. Token-shaped strings are replaced as well. The raw
-runner stream stays under ``runtime/`` and is still passed through this
-filter so a secret is not left on disk.
+least six characters. The match ignores case and zero-width characters, and
+it also removes base64 (and url-safe base64) of those known values. Token-shaped
+strings are replaced as well.
+
+This is best-effort defense in depth, not a boundary. A backslash-u escape,
+a secret split across lines, or a token taskbench never saw (including one
+Grok refreshes) can still pass. API-key-only mode and the deny-read rules
+are the boundary. The raw runner stream stays under ``runtime/`` and is
+still passed through this filter.
 """
 
 from __future__ import annotations
 
+import base64
 import re
 
 _EXACT: list[str] = []
@@ -51,15 +58,47 @@ def remember_json_secrets(value: object) -> None:
             remember_json_secrets(item)
 
 
+# Characters used to hide a secret inside an otherwise exact copy.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u180e\u200e\u200f"), None)
+_MARK = "\ue000REDACTED\ue001"
+
+
 def redact(text: str) -> str:
-    """Replace known secrets and token-shaped strings with ``[redacted]``."""
+    """Replace known secrets and token-shaped strings with ``[redacted]``.
+
+    Best-effort only. See the module docstring for what this does not catch.
+    """
     if not text:
         return text
-    redacted = text
+    redacted = text.translate(_ZERO_WIDTH)
     for secret in sorted(_EXACT, key=len, reverse=True):
-        if secret and secret in redacted:
-            redacted = redacted.replace(secret, "[redacted]")
-    return _TOKEN_RE.sub("[redacted]", redacted)
+        if len(secret) < 6:
+            continue
+        redacted = _replace_ci(redacted, secret)
+        for encoded in _b64_forms(secret):
+            redacted = _replace_ci(redacted, encoded)
+    redacted = _TOKEN_RE.sub(_MARK, redacted)
+    return redacted.replace(_MARK, "[redacted]")
+
+
+def _replace_ci(text: str, needle: str) -> str:
+    if len(needle) < 6:
+        return text
+    return re.sub(re.escape(needle), _MARK, text, flags=re.IGNORECASE)
+
+
+def _b64_forms(secret: str) -> list[str]:
+    """Base64 spellings of a known secret. Shorter than 8 characters is ignored."""
+    raw = secret.encode("utf-8")
+    forms: list[str] = []
+    for encoded in (
+        base64.b64encode(raw).decode("ascii"),
+        base64.urlsafe_b64encode(raw).decode("ascii"),
+    ):
+        for item in (encoded, encoded.rstrip("=")):
+            if len(item) >= 8 and item not in forms:
+                forms.append(item)
+    return forms
 
 
 def drop_from_env(env: dict[str, str]) -> dict[str, str]:

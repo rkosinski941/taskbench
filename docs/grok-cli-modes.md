@@ -59,7 +59,8 @@ taskbench passes the flag and fails closed if the init event is absent or
 `permissionMode` is not `dontAsk`. If a build collapses `dontAsk` to `default`
 in that field, the run fails. That is the check. taskbench does not treat
 `default` as success, and it does not write a project `.claude/settings.json`
-to force `defaultMode`.
+to force `defaultMode`. Deny-read rules go in the pinned home
+(`var/grok-home`), not in the project, and they do not set `defaultMode`.
 
 The real `grok` binary has to confirm this. The tests use a stub that prints
 the init line. A missing event, an empty `permissionMode`, or `default` is a

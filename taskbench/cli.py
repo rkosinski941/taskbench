@@ -1,11 +1,18 @@
-"""Command line. ``python -m taskbench`` does not install anything."""
+"""Command line. ``python -m taskbench`` does not install anything.
+
+Signal handlers are installed only on the main thread. The watcher and the
+HTTP server run as workers and stop when the main thread sets a stop event.
+If a worker dies, the process exits non-zero instead of serving a healthy page.
+"""
 
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 from taskbench import __version__
@@ -51,55 +58,158 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     app = App(config)
     if args.command == "serve":
-        _serve(app)
-        return 0
+        return _serve(app)
     if args.command == "watch":
-        _watch(app)
-        return 0
-    _run(app)
-    return 0
+        return _watch(app)
+    return _run(app)
 
 
-def _watch(app: App) -> None:
-    stop = threading.Event()
+def _install_signals(stop: threading.Event) -> None:
+    """Own SIGINT, SIGTERM, and Windows Ctrl+Break on the main thread only."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("signal handlers are installed only on the main thread")
 
     def handle_stop(*_args: object) -> None:
         stop.set()
-        app.watcher.shutdown()
-
-    import signal
 
     signal.signal(signal.SIGINT, handle_stop)
-    signal.signal(signal.SIGTERM, handle_stop)
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, handle_stop)
+        except (ValueError, OSError):
+            pass
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, handle_stop)
+        except (ValueError, OSError):
+            pass
+
+
+def _guarded(
+    name: str,
+    fn: Callable[[], None],
+    app: App,
+    stop: threading.Event,
+) -> Callable[[], None]:
+    def run() -> None:
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+            app.note_worker_down(f"{name} thread died")
+            stop.set()
+
+    return run
+
+
+def supervise(
+    app: App,
+    stop: threading.Event,
+    workers: list[tuple[str, Callable[[], None]]],
+    shutdown: Callable[[], None] | None = None,
+) -> int:
+    """Run workers until stop. A dead worker is a non-zero exit."""
+    threads: list[threading.Thread] = []
+    for name, fn in workers:
+        thread = threading.Thread(
+            target=_guarded(name, fn, app, stop),
+            name=f"taskbench-{name}",
+            daemon=True,
+        )
+        if name == "watcher":
+            app.watcher_thread = thread
+        thread.start()
+        threads.append(thread)
+    try:
+        while not stop.is_set():
+            if any(not thread.is_alive() for thread in threads):
+                app.note_worker_down("worker thread died")
+                stop.set()
+                break
+            stop.wait(0.05)
+    finally:
+        stop.set()
+        if shutdown is not None:
+            try:
+                shutdown()
+            except Exception:
+                traceback.print_exc()
+                app.note_worker_down("shutdown failed")
+        for thread in threads:
+            thread.join(timeout=5)
+    return 1 if app.worker_down else 0
+
+
+def _watch(app: App) -> int:
+    """Tick on the main thread. This command does not start the page."""
+    stop = threading.Event()
+    _install_signals(stop)
     while not stop.is_set():
         try:
             app.watcher.tick()
         except Exception:
             traceback.print_exc()
+            app.note_worker_down("watcher tick failed")
+            stop.set()
+            break
         stop.wait(app.config.poll_interval_s)
+    app.watcher.shutdown()
+    return 1 if app.worker_down else 0
 
 
-def _serve(app: App) -> None:
+def _serve(app: App) -> int:
     server = serve(app)
     port = int(server.server_address[1])
-    # stdout only. The one-time token is not written to the run log.
-    from taskbench.ui.server import login_url
-
-    print(login_url(app, port), flush=True)
-    print(f"taskbench {app.config.bind_host}:{port}", flush=True)
+    _print_startup(app, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+    return 0
 
 
-def _run(app: App) -> None:
-    thread = threading.Thread(target=_watch, args=(app,), name="taskbench-watcher", daemon=True)
-    thread.start()
-    _serve(app)
-    app.watcher.shutdown()
+def _print_startup(app: App, port: int) -> None:
+    # stdout only. The one-time token is not written to the run log.
+    from taskbench.ui.server import login_url
+
+    print(login_url(app, port), flush=True)
+    print(f"taskbench {app.config.bind_host}:{port}", flush=True)
+
+
+def _run(app: App) -> int:
+    """Page plus watcher. The main thread owns signals and shutdown."""
+    stop = threading.Event()
+    _install_signals(stop)
+    server = serve(app)
+    port = int(server.server_address[1])
+    _print_startup(app, port)
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                app.watcher.tick()
+            except Exception:
+                traceback.print_exc()
+            if stop.is_set():
+                break
+            stop.wait(app.config.poll_interval_s)
+
+    def serve_loop() -> None:
+        server.serve_forever(poll_interval=0.2)
+
+    def shutdown() -> None:
+        app.watcher.shutdown()
+        server.shutdown()
+        server.server_close()
+
+    return supervise(
+        app,
+        stop,
+        [("watcher", watch), ("http", serve_loop)],
+        shutdown,
+    )
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 """The only place that starts the Grok / runner process.
 
 Every launch re-checks the workdir, scans allow rules, pins the command,
-and on Windows points Grok at an empty config home outside the workdir.
-``XAI_API_KEY`` is added only for that Grok process. A context flag is set
-for the duration of the spawn so a runner started any other way is refused.
+and points Grok at an empty config home outside the workdir. ``GROK_HOME``
+is set on every OS. ``HOME`` and ``USERPROFILE`` are replaced only on
+Windows. ``XAI_API_KEY`` is added only for that Grok process. ``auth.json``
+is copied only when the config opts in. A context flag is set for the
+duration of the spawn so a runner started any other way is refused.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from taskbench.permissions import (
     prepare_grok_config_home,
     scan_project_permission_rules,
     seed_grok_credentials,
+    write_grok_deny_rules,
 )
 from taskbench.process_tree import ManagedProcess
 from taskbench.redact import drop_from_env, remember_secret
@@ -102,18 +105,22 @@ def spawn_runner(
     config_home: Path | None = None
     env = adapter.environment(base_env)
     if adapter.name == "grok-build":
-        home = config.data_dir / "grok-home"
-        if os.name == "nt":
-            try:
-                config_home = prepare_grok_config_home(config.data_dir)
-            except PermissionFlagError as exc:
-                raise LaunchRefused(str(exc)) from exc
-            home = config_home
-            _assert_home_outside(home, confirmed)
-            seed_grok_credentials(config_home, base_env)
-            env = adapter.environment(base_env, config_home=config_home)
-        else:
-            _assert_home_outside(home, confirmed)
+        try:
+            config_home = prepare_grok_config_home(config.data_dir)
+            _assert_home_outside(config_home, confirmed)
+            write_grok_deny_rules(config_home, base_env)
+            seed_grok_credentials(
+                config_home,
+                base_env,
+                copy_auth_json=config.copy_auth_json,
+            )
+        except PermissionFlagError as exc:
+            raise LaunchRefused(str(exc)) from exc
+        env = adapter.environment(
+            base_env,
+            config_home=config_home,
+            pin_profile_home=(os.name == "nt"),
+        )
         key = (base_env.get("XAI_API_KEY") or "").strip()
         if key:
             remember_secret(key)

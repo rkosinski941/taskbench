@@ -3,6 +3,8 @@
   "port": 8765,
   "allowed_hosts": [],
   "remote_approvals": false,
+  "copy_auth_json": false,
+  "login_ttl_s": 600,
   "human_owner": "Rich",
   "watcher_name": "taskbench-local",
   "data_dir": "var",

@@ -26,6 +26,8 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
+from taskbench.permissions import banned_permission_in_text
+
 READ_ONLY_OPS = {"list", "read", "diff"}
 _META = ("&&", "||", ";", "|", "`", "$(", "\n", "&")
 _SERVER_RE = re.compile(
@@ -74,6 +76,10 @@ def classify(
 ) -> Decision:
     op = str(action.get("op") or "")
     command = full_command(action)
+    if op not in READ_ONLY_OPS and op != "write":
+        banned = banned_permission_in_text(command)
+        if banned:
+            return Decision("refuse", banned)
     patterns = list(allow or [])
     server = is_long_lived(action, command)
     plan_like = sandbox_only or permissions == "plan"

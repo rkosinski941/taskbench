@@ -442,6 +442,8 @@ class CredentialSeedTests(unittest.TestCase):
         no_key = {key: value for key, value in parent.items() if key != "XAI_API_KEY"}
         home = prepare_grok_config_home(root / "with-file")
         seed_grok_credentials(home, no_key)
+        self.assertEqual(list(home.iterdir()), [])
+        seed_grok_credentials(home, no_key, copy_auth_json=True)
         self.assertEqual((home / "auth.json").read_text(encoding="utf-8"), '{"token":"sekrit-token"}\n')
         if os.name != "nt":
             self.assertEqual((home / "auth.json").stat().st_mode & 0o777, 0o600)

@@ -38,6 +38,7 @@ packet in `var/inbox/`. Examples live in `examples/`.
 | `var/outbox/<id>.json` | `done`, `failed`, `blocked`, `timed-out` |
 | `var/outbox/<id>.prompt.md` | prompt that was sent, secrets redacted |
 | `var/outbox/<id>.output.log` | assistant text, summary, redacted stderr, tool metadata |
+| `var/runtime/<id>.raw.log` | private runner stream (redaction is best-effort) |
 | `projects/<name>/.taskbench/LAST_AGENT.md` | watcher handoff, every terminal state |
 
 The watcher is the only writer of `status`. A transition writes the
@@ -62,13 +63,16 @@ can still answer; the dead process group is killed first.
 - The page binds to `127.0.0.1` and refuses any other address. `Host` must be
   `127.0.0.1` or `localhost` (with the port), plus names listed in
   `allowed_hosts` (empty by default). Startup prints a one-time login URL
-  on the console. Opening it sets an HttpOnly `SameSite=Strict` session
-  cookie. State-changing POSTs need that cookie and the CSRF token, which
-  is not sent to a cookieless request. `Origin` must match, and
-  `Sec-Fetch-Site`, when the browser sends it, must be `same-origin` or
-  `none`. Folder registration and approvals are refused when the request
-  came through Tailscale Serve unless `remote_approvals` is `true`
-  (default `false`).
+  on the console. That link expires on first use and after 10 minutes
+  (`login_ttl_s`, default 600, from 1 to 86400). Opening it sets an HttpOnly
+  `SameSite=Strict` session cookie. State-changing POSTs need that cookie
+  and the CSRF token, which is not sent to a cookieless request. `Origin`
+  must match, and `Sec-Fetch-Site`, when the browser sends it, must be
+  `same-origin` or `none`. Folder registration and approvals are refused
+  when the request came through Tailscale Serve unless `remote_approvals`
+  is `true` (default `false`). `GET /health` reports the watcher. If the
+  watcher thread dies, the page shows "Watcher is down. New tasks will not
+  run." and the process exits non-zero.
 - Grok Build is pinned to `--permission-mode dontAsk` and `--sandbox strict`.
   For the `grok` executable those flags are the first arguments. A later copy
   is removed, so nothing after the pins can override them. When the executable
@@ -100,9 +104,10 @@ can still answer; the dead process group is killed first.
   `defaultMode` other than `dontAsk` blocks the task. A settings file that
   cannot be read or parsed blocks the task too. The status stays
   `blocked`. The page shows **Needs you** and names the file and the rule
-  keys, not the rule values. Deny-only files still run. On Linux, user-level
-  `~/.grok` is not replaced, because `--sandbox strict` is the OS boundary
-  there. `--permission-mode dontAsk` overrides a config `permission_mode`
+  keys, not the rule values. Deny-only files still run. On Linux and macOS,
+  `HOME` is left as the real profile so `--sandbox strict` still applies.
+  `GROK_HOME` is still pointed at the pinned directory on those systems.
+  `--permission-mode dontAsk` overrides a config `permission_mode`
   or `yolo`, but an explicit allow rule in the user config can still
   auto-approve inside that sandbox. `/etc/grok` cannot be redirected.
   Incoming packets may be YAML or JSON. The watcher stores its copy as
@@ -114,13 +119,25 @@ can still answer; the dead process group is killed first.
   Seatbelt only, and the CLI continues when it cannot apply a sandbox.
   taskbench still runs on Windows. It shows `No OS sandbox on Windows; only taskbench approvals protect you`
   on the page and as the first line of each run's output file. For each
-  Grok launch it recreates an empty `var/grok-home` and sets `HOME`,
-  `USERPROFILE`, and `GROK_HOME` to that directory (and `HOMEDRIVE` /
-  `HOMEPATH` when the path has a drive). When `XAI_API_KEY` is set it is
-  passed through the environment allow-list and no credential file is
-  copied. Otherwise only `auth.json` is copied into that home, never
-  settings. Details, doc URLs, and the laptop check are in
-  `docs/grok-cli-home-and-auth.md` and `docs/laptop-test-plan.md`.
+  Grok launch, on every OS, it recreates `var/grok-home`, locks that
+  directory to the current user, and sets `GROK_HOME` there. On Windows it
+  also sets `HOME`, `USERPROFILE`, and, when the path has a drive,
+  `HOMEDRIVE` and `HOMEPATH`. API-key-only is the default: a scoped
+  `XAI_API_KEY` is added to the Grok process after the environment scrub,
+  and `auth.json` is not copied. `copy_auth_json: true` is an explicit
+  opt-in. Copying auth.json is on only when that flag is true. A session
+  token outranks `XAI_API_KEY`. API-key-only is the default and the safer
+  choice. The page shows that warning when the flag is on. In every mode
+  the pinned home gets deny-read rules so Grok's own read tools cannot open
+  the pinned home or the real profile's `.grok` and `.claude`. Redaction of
+  published text is best-effort (zero-width characters, case, and base64 of
+  known secrets). It is not a boundary: backslash-u escapes, secrets split
+  across lines, and tokens taskbench never saw can still pass. A shell
+  command the run asks to execute is scanned for banned permission flags in
+  the full command text, including `sh -c`, `cmd /c`, and `powershell -c`
+  payloads. A clean command still needs approval. Details, doc URLs, and
+  the laptop check are in `docs/grok-cli-home-and-auth.md` and
+  `docs/laptop-test-plan.md`.
 - The runner and any sidecar share an environment allow-list (`PATH`,
   locale, and a few Windows system variables). `GROK_*`, `PYTHONPATH`,
   `XDG_CONFIG_HOME`, and similar parent overrides are not passed through.

@@ -10,18 +10,21 @@ else that looks like a permission flag is rejected. The child does not
 inherit the parent environment: only an explicit allow-list is copied, then
 ``TASKBENCH_APPROVALS=1`` is set by taskbench itself.
 
-On Windows there is no OS sandbox. The Grok process is still started.
-``HOME``, ``USERPROFILE``, and ``GROK_HOME`` are pointed at an empty
-taskbench directory recreated before each run. The review names ``HOME`` and
-``USERPROFILE`` as the variables that cause ``~/.grok`` and ``~/.claude`` to
-be read; ``GROK_HOME`` is pinned to that same directory so the documented
-grok-home override cannot point anywhere else.
+On every OS the Grok process gets ``GROK_HOME`` pointed at an empty
+taskbench directory recreated before each run. On Windows, ``HOME`` and
+``USERPROFILE`` are pointed at that same directory (there is no OS sandbox).
+On Linux and macOS those two stay as the real profile so ``--sandbox strict``
+still applies. API-key-only is the default: ``auth.json`` is copied only when
+``copy_auth_json`` is set. Deny-read rules in the pinned home name that
+directory and the real profile's ``.grok`` and ``.claude``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 import tomllib
@@ -169,6 +172,46 @@ def iter_flags(args: list[str]) -> list[tuple[str, str | None]]:
     return found
 
 
+def banned_permission_in_text(text: str) -> str | None:
+    """Refuse banned permission flags anywhere in a command a run wants to execute.
+
+    The check tokenizes the whole string, including the payload of
+    ``sh -c``, ``cmd /c``, and ``powershell -c``. A clean command is not
+    approved by this function; callers still require an approval or an
+    allow-list match.
+    """
+    if not text:
+        return None
+    try:
+        check_permission_args(_flatten_command(text))
+    except PermissionFlagError as exc:
+        return str(exc)
+    return None
+
+
+def _flatten_command(text: str, depth: int = 0) -> list[str]:
+    """Split a shell command and the quoted payloads inside it."""
+    if depth > 6:
+        return text.split()
+    try:
+        parts = shlex.split(text, posix=True)
+    except ValueError:
+        parts = text.split()
+    flat: list[str] = []
+    for part in parts:
+        if part != text and any(ch.isspace() for ch in part):
+            flat.extend(_flatten_command(part, depth + 1))
+        else:
+            flat.append(part)
+    # A payload that shlex kept as one word can still contain `--flag value`.
+    if len(flat) == 1 and flat[0] == text and _FLAG_WORD.search(text):
+        return text.split()
+    return flat
+
+
+_FLAG_WORD = re.compile(r"(?:^|\s)--?[A-Za-z]")
+
+
 def check_permission_args(args: list[str]) -> None:
     """Reject banned and unknown permission flags. Allow only the pinned pair.
 
@@ -295,9 +338,6 @@ WINDOWS_SANDBOX_BANNER = "No OS sandbox on Windows; only taskbench approvals pro
 
 # The review names HOME and USERPROFILE. GROK_HOME is the documented grok
 # directory override and is pinned to the same empty directory.
-_CONFIG_HOME_VARS = ("HOME", "USERPROFILE", "GROK_HOME")
-
-
 def windows_sandbox_banner(platform: str | None = None) -> str:
     """The Windows banner, or an empty string on every other platform."""
     plat = os.name if platform is None else platform
@@ -316,21 +356,26 @@ def prefix_output(text: str, platform: str | None = None) -> str:
     return banner + "\n" + text
 
 
-def seed_grok_credentials(home: Path, base_env: dict[str, str]) -> None:
-    """Copy only ``auth.json`` when ``XAI_API_KEY`` is not set.
+def seed_grok_credentials(
+    home: Path,
+    base_env: dict[str, str],
+    *,
+    copy_auth_json: bool = False,
+) -> None:
+    """Copy ``auth.json`` only when the owner opted in.
 
-    Public docs: an active session in ``auth.json`` outranks ``XAI_API_KEY``.
-    When the API key is present, no credential file is copied. Settings files
-    are never copied. This is used for the pinned Windows config home.
+    API-key-only is the default on every OS. A session token in ``auth.json``
+    outranks ``XAI_API_KEY``, so the copy is off unless ``copy_auth_json`` is
+    true. Settings files are never copied. The file is created inside a home
+    directory that is already owner-only.
     """
-    if (base_env.get("XAI_API_KEY") or "").strip():
+    if not copy_auth_json:
         return
     source = _credential_source(base_env)
     if source is None or not source.is_file():
         return
     target = Path(home) / "auth.json"
-    target.write_bytes(source.read_bytes())
-    lock_owner_only(target)
+    _write_private(target, source.read_bytes())
     _remember_auth_file(target)
 
 
@@ -350,9 +395,21 @@ def _credential_source(base_env: dict[str, str]) -> Path | None:
 
 
 def lock_owner_only(path: Path) -> None:
-    """Owner-only permissions. POSIX is ``0600``. Windows is an ACL for this user."""
+    """Owner-only permissions. POSIX is ``0600``. Windows is an ACL for this user.
+
+    POSIX creates the file with mode ``0600`` (there is no chmod-after-write
+    step). Windows writes it only after the parent directory's DACL is already
+    limited to the process token's SID, then sets the file ACE with ``icacls``
+    from ``GetSystemDirectoryW`` to read, write, and delete for that SID.
+    The SID comes from the process token, not from ``USERNAME``. The
+    directory lock is the boundary the stdlib can apply before the file
+    exists; a security descriptor on the create call is not available.
+    """
     if os.name == "nt":
         _windows_owner_only(path)
+        return
+    if not path.exists():
+        _write_private(path, b"")
         return
     os.chmod(path, 0o600)
     mode = path.stat().st_mode & 0o777
@@ -360,20 +417,135 @@ def lock_owner_only(path: Path) -> None:
         raise PermissionFlagError(f"auth.json mode is {mode:o}, expected 600")
 
 
+def _write_private(path: Path, data: bytes) -> None:
+    """Create or replace ``path`` with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        # The parent is locked before the bytes exist. The file ACE is applied
+        # after the write; the stdlib has no create-time security descriptor.
+        _windows_lock_directory(path.parent)
+        path.write_bytes(data)
+        _windows_owner_only(path)
+        return
+    if path.exists():
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    mode = path.stat().st_mode & 0o777
+    if mode != 0o600:
+        raise PermissionFlagError(f"auth.json mode is {mode:o}, expected 600")
+
+
 def _windows_owner_only(path: Path) -> None:
-    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
-    if not user:
-        raise PermissionFlagError("cannot lock auth.json without the current user name")
     import subprocess
 
+    icacls = _icacls_path()
+    sid = _current_user_sid()
     completed = subprocess.run(
-        ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+        [icacls, str(path), "/inheritance:r", "/grant:r", f"*{sid}:(R,W,D)"],
         capture_output=True,
         text=True,
         check=False,
     )
     if completed.returncode != 0:
         raise PermissionFlagError("could not lock auth.json to the current user")
+
+
+def _windows_lock_directory(directory: Path) -> None:
+    """Limit a directory to the current user's SID before any file is created."""
+    import subprocess
+
+    icacls = _icacls_path()
+    sid = _current_user_sid()
+    completed = subprocess.run(
+        [icacls, str(directory), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)(F)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise PermissionFlagError("could not lock the grok home to the current user")
+
+
+def _icacls_path() -> str:
+    """Absolute ``icacls.exe`` from ``GetSystemDirectoryW``, not ``PATH``."""
+    system = _system_directory()
+    path = str(Path(system) / "icacls.exe")
+    if not os.path.isfile(path):
+        raise PermissionFlagError("icacls.exe was not found in the system directory")
+    return path
+
+
+def _system_directory() -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    kernel32.GetSystemDirectoryW.restype = wintypes.UINT
+    buf = ctypes.create_unicode_buffer(260)
+    written = kernel32.GetSystemDirectoryW(buf, len(buf))
+    if not written or written >= len(buf):
+        raise PermissionFlagError("GetSystemDirectoryW failed")
+    return buf.value
+
+
+def _current_user_sid() -> str:
+    """SID of the process token. Not ``USERNAME`` and not an environment variable."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    class _SidAndAttrs(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttrs)]
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise PermissionFlagError("cannot read the process token")
+    try:
+        needed = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+        buf = ctypes.create_string_buffer(max(needed.value, 1))
+        if not advapi32.GetTokenInformation(token, 1, buf, len(buf), ctypes.byref(needed)):
+            raise PermissionFlagError("cannot read the process token user")
+        user = ctypes.cast(buf, ctypes.POINTER(_TokenUser)).contents
+        sid_text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(user.User.Sid), ctypes.byref(sid_text)):
+            raise PermissionFlagError("cannot convert the user SID")
+        try:
+            value = sid_text.value
+            if not value:
+                raise PermissionFlagError("cannot convert the user SID")
+            return value
+        finally:
+            kernel32.LocalFree(ctypes.cast(sid_text, wintypes.HLOCAL))
+    finally:
+        kernel32.CloseHandle(token)
 
 
 def _remember_auth_file(path: Path) -> None:
@@ -400,10 +572,14 @@ def wipe_grok_credentials(data_dir: Path) -> None:
 
 
 def prepare_grok_config_home(data_dir: Path) -> Path:
-    """Recreate ``data_dir/grok-home`` as an empty real directory.
+    """Recreate ``data_dir/grok-home`` and lock it to the current user.
 
-    A symlink is removed and not followed. The directory is checked empty
-    before it is handed to the child.
+    A symlink is removed and not followed. The directory is checked empty,
+    then locked, before any file is written into it. POSIX uses mode
+    ``0700``. Windows calls ``icacls`` from ``GetSystemDirectoryW`` and grants
+    only the process token's SID. The stdlib cannot attach a security
+    descriptor at ``mkdir`` time, so there is a short gap before ``icacls``.
+    Credential files are created only after this lock.
     """
     home = Path(data_dir) / "grok-home"
     home.parent.mkdir(parents=True, exist_ok=True)
@@ -417,14 +593,90 @@ def prepare_grok_config_home(data_dir: Path) -> Path:
     home.mkdir(parents=False, exist_ok=False)
     if any(home.iterdir()):
         raise PermissionFlagError("grok config home was not empty after recreate")
+    _lock_home_dir(home)
     return home
 
 
-def apply_config_home(env: dict[str, str], home: Path) -> dict[str, str]:
-    """Point config-dir variables at ``home``. Other allow-listed values stay."""
+def _lock_home_dir(home: Path) -> None:
+    if os.name == "nt":
+        _windows_lock_directory(home)
+        return
+    os.chmod(home, 0o700)
+    mode = home.stat().st_mode & 0o777
+    if mode != 0o700:
+        raise PermissionFlagError(f"grok home mode is {mode:o}, expected 700")
+
+
+def write_grok_deny_rules(home: Path, base_env: dict[str, str]) -> None:
+    """Write deny-read rules into the pinned home, not into the project.
+
+    Grok's own read tools are not a taskbench approval. The rules name the
+    pinned home and the real profile's ``.grok`` and ``.claude`` (from
+    ``HOME`` and ``USERPROFILE`` before those variables are replaced). They
+    do not set ``defaultMode`` and they do not copy the user's allow list.
+    """
+    patterns = _read_deny_patterns(_deny_read_targets(home, base_env))
+    if not patterns:
+        return
+    settings = json.dumps({"permissions": {"deny": patterns}}, indent=2).encode("utf-8") + b"\n"
+    lines = ["[permissions]", "deny = ["]
+    lines.extend(f"  {json.dumps(item)}," for item in patterns)
+    lines.append("]")
+    lines.append("")
+    toml = "\n".join(lines).encode("utf-8")
+    _write_private(Path(home) / ".claude" / "settings.json", settings)
+    _write_private(Path(home) / ".grok" / "config.toml", toml)
+    _write_private(Path(home) / "config.toml", toml)
+
+
+def _deny_read_targets(home: Path, base_env: dict[str, str]) -> list[str]:
+    targets = [str(home)]
+    for key in ("HOME", "USERPROFILE"):
+        value = (base_env.get(key) or "").strip()
+        if not value:
+            continue
+        root = Path(value)
+        targets.append(str(root / ".grok"))
+        targets.append(str(root / ".claude"))
+    seen: list[str] = []
+    for item in targets:
+        if item and item not in seen:
+            seen.append(item)
+    return seen
+
+
+def _read_deny_patterns(targets: list[str]) -> list[str]:
+    patterns: list[str] = []
+    for raw in targets:
+        forms = [raw]
+        if "\\" in raw:
+            forms.append(raw.replace("\\", "/"))
+        for form in forms:
+            for pattern in (f"Read({form})", f"Read({form}/**)"):
+                if pattern not in patterns:
+                    patterns.append(pattern)
+    return patterns
+
+
+def apply_config_home(
+    env: dict[str, str],
+    home: Path,
+    *,
+    pin_profile_home: bool = True,
+) -> dict[str, str]:
+    """Point ``GROK_HOME`` at ``home``.
+
+    ``pin_profile_home`` also replaces ``HOME`` and ``USERPROFILE``. Windows
+    launches pass true. Linux and macOS pass false so the real home, and the
+    OS sandbox that depends on it, stay in place. The default is true so a
+    direct call still pins the profile variables.
+    """
     pinned = str(home)
     updated = dict(env)
-    for name in _CONFIG_HOME_VARS:
+    updated["GROK_HOME"] = pinned
+    if not pin_profile_home:
+        return updated
+    for name in ("HOME", "USERPROFILE"):
         updated[name] = pinned
     drive, tail = os.path.splitdrive(pinned)
     if drive:

@@ -278,7 +278,11 @@ class CredentialTests(TempApp):
         source = self.root / "real-home"
         (source / ".grok").mkdir(parents=True)
         (source / ".grok" / "auth.json").write_text('{"token":"copied-auth-token"}\n', encoding="utf-8")
-        seed_grok_credentials(home, {"HOME": str(source), "USERPROFILE": str(source)})
+        seed_grok_credentials(
+            home,
+            {"HOME": str(source), "USERPROFILE": str(source)},
+            copy_auth_json=True,
+        )
         auth = home / "auth.json"
         self.assertTrue(auth.is_file())
         if os.name != "nt":

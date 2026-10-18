@@ -85,6 +85,8 @@ class Config:
     runners: dict[str, RunnerConfig] = field(default_factory=dict)
     config_path: Path | None = None
     remote_approvals: bool = False
+    copy_auth_json: bool = False
+    login_ttl_s: int = 600
 
 
 def load_config(path: Path) -> Config:
@@ -114,6 +116,12 @@ def load_config(path: Path) -> Config:
     remote = raw.get("remote_approvals", False)
     if remote is not True and remote is not False:
         raise ConfigError("remote_approvals must be a boolean")
+    copy_auth = raw.get("copy_auth_json", False)
+    if copy_auth is not True and copy_auth is not False:
+        raise ConfigError("copy_auth_json must be a boolean")
+    ttl = raw.get("login_ttl_s", 600)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not (1 <= ttl <= 86400):
+        raise ConfigError("login_ttl_s must be an integer from 1 to 86400")
     loaded = Config(
         bind_host=bind_host,
         port=port,
@@ -125,6 +133,8 @@ def load_config(path: Path) -> Config:
         config_path=path.resolve(),
         runners=runners,
         remote_approvals=remote is True,
+        copy_auth_json=copy_auth is True,
+        login_ttl_s=ttl,
     )
     return loaded
 

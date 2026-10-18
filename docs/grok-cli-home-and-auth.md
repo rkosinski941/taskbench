@@ -1,8 +1,8 @@
 # Grok CLI home and auth on Windows
 
 taskbench does not refuse to run Grok on Windows. There is no OS sandbox
-there. Each Grok launch gets an empty directory, and the page and the output
-file start with:
+there. Each Grok launch gets a directory taskbench recreates, and the page
+and the output file start with:
 
 `No OS sandbox on Windows; only taskbench approvals protect you`
 
@@ -22,9 +22,11 @@ home. When `GROK_HOME` is unset, the example config is
 
 The public pages name `USERPROFILE` for the Windows path and `GROK_HOME` as
 the override. They do not mention `SHGetKnownFolderPath`, `FOLDERID_Profile`,
-or any other Windows known-folder API. taskbench still pins `HOME`,
+or any other Windows known-folder API. On Windows, taskbench pins `HOME`,
 `USERPROFILE`, `GROK_HOME`, and, when the path has a drive, `HOMEDRIVE` and
-`HOMEPATH`, at a directory it recreates empty before the launch.
+`HOMEPATH`, at a directory it recreates before the launch. On Linux and
+macOS it pins `GROK_HOME` only, so the real `HOME` (and `--sandbox strict`)
+stay in place.
 
 `/etc/grok/managed_config.toml` and `/etc/grok/requirements.toml` are
 system layers. Pointing `GROK_HOME` elsewhere does not move them. On Windows
@@ -54,19 +56,55 @@ Claude-compatible `settings.json`. Those are not credentials.
 
 ## What taskbench does
 
-Preferred order, matching that precedence:
+API-key-only is the default on every OS. Copying `auth.json` is off unless
+`copy_auth_json` is `true`.
 
-1. If `XAI_API_KEY` is set in the parent environment, it is copied through
-   the environment allow-list. `auth.json` is not copied. Copying it would
-   outrank the API key.
-2. Otherwise taskbench copies only `auth.json` into the pinned home. The
-   source is `$GROK_HOME/auth.json` when that variable is set, otherwise
-   `%USERPROFILE%\.grok\auth.json` or `$HOME/.grok/auth.json`. `config.toml`,
-   `settings.json`, and every other file stay behind.
+1. `XAI_API_KEY` is not on the environment allow-list. After the scrub,
+   taskbench adds it to the Grok process only. Companion processes do not
+   receive it.
+2. `auth.json` is not copied. A session token in that file outranks
+   `XAI_API_KEY`, so the default leaves it behind.
+3. Opt-in only: `copy_auth_json: true` copies `auth.json` even when an API
+   key is also set. The page shows a warning when that flag is on. The
+   source is `$GROK_HOME/auth.json` when that variable is set in the parent,
+   otherwise `%USERPROFILE%\.grok\auth.json` or `$HOME/.grok/auth.json`.
+   The user's `config.toml` and `settings.json` are still not copied.
+   Prefer the default. Copying `auth.json` is the louder, worse choice.
 
-Linux and macOS do not get this empty home. `--sandbox strict` is the OS
-boundary there, and replacing `HOME` would drop that boundary. The allow-rule
-scan still walks the workdir and its parents on every OS.
+The copy, when opted in, is written into a directory that is already locked
+to the current user. POSIX creates the file as mode `0600`. Windows resolves
+`icacls.exe` from `GetSystemDirectoryW` (not `PATH`), reads the user SID from
+the process token (not `USERNAME`), locks the directory, then writes the
+file. The stdlib cannot pass a security descriptor to `mkdir`, so there is a
+short gap before `icacls`. The file is not created in that gap. taskbench
+deletes `var/grok-home/auth.json` at startup and after every run.
+
+## Deny-read rules
+
+Every Grok launch, in every mode, writes deny-read rules into the pinned
+home:
+
+- `var/grok-home/.claude/settings.json`
+- `var/grok-home/.grok/config.toml`
+- `var/grok-home/config.toml`
+
+The deny list is `Read(<path>)` and `Read(<path>/**)` for the pinned home
+and for the real profile's `.grok` and `.claude` (from `HOME` and
+`USERPROFILE` before those variables are replaced, plus forward-slash forms
+when the path contains backslashes). The rules do not set `defaultMode`.
+They are not a project `.claude/settings.json`. `docs/laptop-test-plan.md`
+says how to confirm Grok's own read tools deny those paths: the denial is
+in `var\runtime\<id>.raw.log`, and **Needs you** does not count.
+
+## Redaction is not the boundary
+
+Published outbox text is passed through a best-effort redactor. It strips
+zero-width characters, matches known secrets without case, and removes
+base64 and url-safe base64 of those known values, plus a few token shapes.
+A backslash-u escape, a secret split across lines, or a token taskbench
+never saw (including one Grok refreshes) can still get through. Do not treat
+redaction as a boundary. The boundary is API-key-only mode plus the
+deny-read rules above.
 
 ## If the pin is not enough
 

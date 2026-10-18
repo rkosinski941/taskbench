@@ -75,10 +75,16 @@ class GrokBuildAdapter(Adapter):
             argv.append(arg)
         return ensure_pinned_args(argv)
 
-    def environment(self, base: dict[str, str], *, config_home: Path | None = None) -> dict[str, str]:
+    def environment(
+        self,
+        base: dict[str, str],
+        *,
+        config_home: Path | None = None,
+        pin_profile_home: bool = True,
+    ) -> dict[str, str]:
         env = super().environment(base)
         if config_home is not None:
-            env = apply_config_home(env, config_home)
+            env = apply_config_home(env, config_home, pin_profile_home=pin_profile_home)
         return env
 
     def parse_line(self, line: str) -> dict[str, Any] | None:

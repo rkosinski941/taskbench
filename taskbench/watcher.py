@@ -23,6 +23,7 @@ from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import Config
 from taskbench.launch import LaunchRefused, spawn_runner
 from taskbench.permissions import (
+    banned_permission_in_text,
     needs_you_message,
     prefix_output,
     scan_project_permission_rules,
@@ -520,7 +521,10 @@ class Watcher:
         command = full_command(action)
         if decision.kind == "allow":
             self.store.log(f"{packet['id']} allow-match {command}")
-            self._execute_action(packet, action, command)
+            refused = self._execute_action(packet, action, command)
+            if refused:
+                self._reply({"ok": False, "refused": refused})
+                return "continue"
             fatal = self._fail_if_unconfined(packet)
             if fatal:
                 return fatal
@@ -555,16 +559,34 @@ class Watcher:
         meta = self.store.read_meta(packet_id)
         action = meta.get("pending_action") or self.run_state.get("pending") or {}
         command = str(meta.get("pending_command") or full_command(action if isinstance(action, dict) else {}))
+        if approved:
+            banned = banned_permission_in_text(command)
+            if banned:
+                self._mark_decision(packet, "denied")
+                self.store.log(f"{packet_id} refuse {banned}: {command}")
+                self.store.append_output(packet_id, f"refused: {banned}\n")
+                self._reply({"ok": False, "refused": banned})
+                self._resume_after_decision(packet)
+                return
         self._mark_decision(packet, "approved" if approved else "denied")
         if not approved:
             return
         self.store.log(f"{packet_id} approval approved {command}")
         if isinstance(action, dict):
-            self._execute_action(packet, action, command)
-            if self.run_state.get("fatal"):
+            refused = self._execute_action(packet, action, command)
+            if refused:
+                self._reply({"ok": False, "refused": refused})
+            elif self.run_state.get("fatal"):
                 self._kill_and_finish(packet, "failed", str(self.run_state["fatal"]), killed=True)
                 return
-        self._reply({"ok": True, "approved": True})
+            else:
+                self._reply({"ok": True, "approved": True})
+        else:
+            self._reply({"ok": True, "approved": True})
+        self._resume_after_decision(packet)
+
+    def _resume_after_decision(self, packet: dict[str, Any]) -> None:
+        packet_id = str(packet["id"])
         packet["status"] = "running"
         meta = self.store.read_meta(packet_id)
         meta["decision"] = None
@@ -580,29 +602,36 @@ class Watcher:
                 break
         packet["approvals"] = approvals
 
-    def _execute_action(self, packet: dict[str, Any], action: dict[str, Any], command: str) -> None:
+    def _execute_action(self, packet: dict[str, Any], action: dict[str, Any], command: str) -> str | None:
+        """Run an action. A banned permission flag is not executed."""
         op = str(action.get("op") or "")
         folder: Path = self.run_state["project"]
         packet_id = str(packet["id"])
+        if op not in {"list", "read", "diff", "write"}:
+            banned = banned_permission_in_text(command)
+            if banned:
+                self.store.log(f"{packet_id} refuse {banned}: {command}")
+                self.store.append_output(packet_id, f"refused: {banned}\n")
+                return banned
         try:
             if op in {"list", "read", "diff"}:
                 result = execute_readonly(folder, action)
                 self.store.append_raw(packet_id, result + ("\n" if result and not result.endswith("\n") else ""))
-                return
+                return None
             if op == "write":
                 result = execute_write(folder, action)
                 self.store.append_raw(packet_id, result + "\n")
-                return
+                return None
         except Exception as exc:  # path escapes are refusals, not crashes
             self.store.append_output(packet_id, f"action error: {exc}\n")
             self.store.log(f"{packet_id} action error {exc}")
-            return
+            return None
         if _is_server(action, command):
             url = preview_url(command)
             if url is None or not _loopback_command(command):
                 self.store.append_output(packet_id, "refused: server must bind 127.0.0.1\n")
                 self.store.log(f"{packet_id} refuse server bind {command}")
-                return
+                return None
             try:
                 if self.proc is None:
                     env = self.adapter.environment(os.environ.copy()) if self.adapter else os.environ.copy()
@@ -619,17 +648,18 @@ class Watcher:
                 self.run_state["fatal"] = (
                     f"refusing sidecar outside the process tree: {exc}"
                 )
-                return
+                return None
             except Exception as exc:
                 self.store.append_output(packet_id, f"server error: {exc}\n")
-                return
+                return None
             meta = self.store.read_meta(packet_id)
             meta["preview_url"] = url
             self.store.write_meta(packet_id, meta)
             self.store.append_output(packet_id, f"preview {url}\n")
             self._note_pids()
-            return
+            return None
         self._run_foreground_command(packet, command)
+        return None
 
     def _fail_if_unconfined(self, packet: dict[str, Any]) -> str | None:
         reason = self.run_state.get("fatal")

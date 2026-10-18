@@ -18,6 +18,8 @@ import html
 import json
 import os
 import secrets
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -132,13 +134,41 @@ class App:
         # They are never written to disk, the run log, or a child environment.
         self.login_token = secrets.token_urlsafe(32)
         self.login_consumed = False
+        self.login_issued = time.monotonic()
         self.session_secret = secrets.token_urlsafe(32)
         self.csrf_token = secrets.token_urlsafe(32)
+        self.watcher_thread: threading.Thread | None = None
+        self.worker_down = False
+        self.worker_down_reason = ""
         from taskbench.redact import remember_secret
 
         remember_secret(self.login_token)
         remember_secret(self.session_secret)
         remember_secret(self.csrf_token)
+
+    def note_worker_down(self, reason: str) -> None:
+        """Record that a supervised worker died. The page and /health show it."""
+        self.worker_down = True
+        if reason and not self.worker_down_reason:
+            self.worker_down_reason = reason
+
+    def login_expired(self) -> bool:
+        """The one-time URL expires on first use and after ``login_ttl_s``."""
+        return time.monotonic() - self.login_issued > self.config.login_ttl_s
+
+    def watcher_healthy(self) -> bool:
+        """True when no supervised watcher has died.
+
+        Unit tests tick the watcher themselves and never attach a thread.
+        That is healthy. The ``run`` command attaches the thread; if it
+        stops, the page is not healthy.
+        """
+        if self.worker_down:
+            return False
+        thread = self.watcher_thread
+        if thread is None:
+            return True
+        return thread.is_alive()
 
 
 def login_url(app: App, port: int) -> str:
@@ -160,6 +190,9 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/login":
             self._login(parse_qs(parsed.query))
+            return
+        if path == "/health":
+            self._health()
             return
         if path == "/":
             query = parse_qs(parsed.query)
@@ -337,6 +370,9 @@ class Handler(BaseHTTPRequestHandler):
     def _login(self, query: dict[str, list[str]]) -> None:
         supplied = (query.get("token") or [""])[-1]
         app = self.server.app
+        if app.login_expired():
+            self._send(403, "text/plain; charset=utf-8", b"login token expired", None)
+            return
         if app.login_consumed or not _same_secret(supplied, app.login_token):
             self._send(403, "text/plain; charset=utf-8", b"login token check failed", None)
             return
@@ -353,6 +389,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.end_headers()
         self.wfile.write(body)
+
+    def _health(self) -> None:
+        app = self.server.app
+        if app.watcher_healthy():
+            body = b'{"watcher":"up"}\n'
+            self._send(200, "application/json", body, None)
+            return
+        reason = app.worker_down_reason or "watcher is down"
+        payload = json.dumps({"watcher": "down", "reason": reason}, separators=(",", ":")).encode("utf-8") + b"\n"
+        self._send(503, "application/json", payload, None)
 
     def _session_ok(self) -> bool:
         cookie = _cookie(self.headers.get("Cookie"), SESSION_COOKIE)
@@ -512,7 +558,7 @@ def render_index(
         grouped.setdefault(status, []).append(packet)
     queue = {item["id"]: item for item in queue_view(app.store)}
     parts = [
-        _page_start(tailscale_user),
+        _page_start(tailscale_user, app),
         _composer(app, token, prefill_workdir=prefill_workdir, local_picker=local_picker),
         "",
     ]
@@ -530,7 +576,7 @@ def render_index(
 
 def render_task(app: App, packet: dict[str, Any], token: str, tailscale_user: str | None) -> str:
     parts = [
-        _page_start(tailscale_user),
+        _page_start(tailscale_user, app),
         f"<p><a href='/'>All tasks</a></p>",
         _card(app, packet, token, None),
         _page_end(),
@@ -677,7 +723,7 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
     return "".join(parts)
 
 
-def _page_start(tailscale_user: str | None) -> str:
+def _page_start(tailscale_user: str | None, app: App | None = None) -> str:
     who = ""
     if tailscale_user:
         who = (
@@ -699,11 +745,30 @@ def _page_start(tailscale_user: str | None) -> str:
         "pre.command,pre.diff{max-height:12rem;overflow:auto;white-space:pre-wrap;"
         "word-break:break-word;background:#f6f6f6;padding:.5rem}"
         ".sandbox-banner{background:#fff3cd;padding:.5rem}"
+        ".watcher-down,.auth-warning{background:#f8d7da;padding:.5rem}"
         "</style></head><body><h1>taskbench</h1>"
         "<p>Local runner. Artifacts are files. There is no preview pane.</p>"
         + banner_html
+        + _status_banners(app)
         + who
     )
+
+
+def _status_banners(app: App | None) -> str:
+    if app is None:
+        return ""
+    parts: list[str] = []
+    if not app.watcher_healthy():
+        parts.append(
+            "<p class='watcher-down' data-watcher='down'>Watcher is down. "
+            "New tasks will not run.</p>"
+        )
+    if app.config.copy_auth_json:
+        parts.append(
+            "<p class='auth-warning'>Copying auth.json is on. A session token "
+            "outranks XAI_API_KEY. API-key-only is the default and the safer choice.</p>"
+        )
+    return "".join(parts)
 
 
 def _page_end() -> str:
