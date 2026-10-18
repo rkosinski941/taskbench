@@ -18,6 +18,7 @@ should show. Generic project and runner names only.
 | 10 | **Direct links go to the wrong project.** A link to a task or thread opened a different project. | Each task has a stable URL built from its `id` alone (e.g. `/task/<id>`). Test that opening it shows that task and its `project`, and that an unknown id gives a "not found" page rather than a redirect. |
 | 11 | **Remote edits need desktop review.** Edits started from the web couldn't be approved there and had to be reviewed on the desktop. | Every approval, including file edits with a diff, can be made from the web page alone. No step needs a separate desktop app. |
 | 12 | **Previews never render remotely.** The preview pane only ever said it was busy. | taskbench has no built-in preview pane in v1. Artifacts are linked as files from the outbox. If an approved local preview is running, the page links to its 127.0.0.1 address. Nothing shows a pane that can't load. |
+| 13 | **A bot names a folder the owner has not used.** The packet sets `workdir` to an absolute path. The path may be new, or a symlink or junction into a system directory, a drive root, or the profile root. | The watcher resolves links first. A rejected path is `blocked` with reason `invalid workdir`. A valid folder that is not in the local registry goes to `needs-approval` (the page shows Needs you) with the resolved path, and is not registered until the owner approves it. A folder the owner already accepted, or one sent as `from: web-ui`, is the run root for the allow-list, instructions, and logs. |
 
 ## General checks
 

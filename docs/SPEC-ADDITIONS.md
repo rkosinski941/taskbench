@@ -24,7 +24,11 @@ When `workdir` is present:
   the local data directory (`workdir-registry.json`). That file is not part
   of the project repo.
 - Any other `from` may use only a folder already in that registry. An
-  unregistered path is `blocked` with a reason that starts `Needs you:` and
-  includes the resolved path. It is not added to the registry.
+  unregistered path goes to `needs-approval`. The page shows **Needs you**
+  and the resolved path. It is not added to the registry until the owner
+  approves that folder.
+- A rejected path (missing, not a directory, drive root, profile root, or
+  system folder, including a symlink or junction that lands there) is
+  `blocked` with reason `invalid workdir`.
 
 `project` is still required and is still a short name, not a path.

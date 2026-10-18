@@ -26,7 +26,7 @@ Who writes each field: **S** = sender, **W** = watcher, **R** = runner adapter.
 | `model.requested` | string | no | S | e.g. `grok-4.7`. `null` = runner default. |
 | `model.actual` | string | no | **R** | The model id the runner reports for the run, not the UI label. |
 | `project` | string | yes | S | Folder name relative to the taskbench projects root, e.g. `demo-canvas`. **Never an absolute path**, no `..`, no drive letters. |
-| `workdir` | string | no | S | Optional absolute folder for this task. See `docs/SPEC-ADDITIONS.md`. When set, it replaces the project directory as the run root. |
+| `workdir` | string | no | S (trust: W) | Optional absolute folder for this task. The sender writes it. The watcher resolves it and decides whether it may be used. See behaviour 13. |
 | `permissions` | enum | no | S | `plan` \| `ask` \| `allow-list`. **Default `ask`.** |
 | `allow` | list of strings | if `allow-list` | S | Command patterns that may run without a prompt (glob-style, matched against the full command line). Anything else still asks. |
 | `timeout_s` | integer | no | S | Wall-clock limit in seconds. Default 900. Max 7200. |
@@ -128,6 +128,19 @@ moves a packet between states, and every change goes in the run log.
 12. **Every run is plain files.** The outbox gets `<id>.yaml` (the final
     packet), `<id>.prompt.md` (the exact prompt sent), and `<id>.output.log`
     (the full runner output).
+13. **Working directory.** `workdir`, when set, is an absolute folder. The
+    watcher resolves symlinks and Windows junctions first (`realpath`), then
+    rejects a path that does not exist, is not a directory, is a drive root,
+    is the user profile root itself, or is inside a system folder
+    (`blocked`, reason `invalid workdir`). The resolved folder is the project
+    root for the allow-list, `INSTRUCTIONS.md`, `.taskbench` logs,
+    `LAST_AGENT.md`, and the project allow-rule scan. The resolved path is
+    shown on the task and in the approval prompt. `from: web-ui` may use a
+    new valid folder; the watcher registers it in taskbench's local state,
+    not in the repo. Any other sender may use only a folder already in that
+    registry. An unregistered bot folder goes to `needs-approval` (the page
+    shows **Needs you**) with the resolved path, and it is not registered
+    until the owner approves that folder. Denying it does not register it.
 
 ## Examples
 

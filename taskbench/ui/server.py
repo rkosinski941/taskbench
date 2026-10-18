@@ -198,8 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 chosen = validate_workdir(workdir_raw)
             except WorkdirError as exc:
-                shown = exc.resolved or workdir_raw
-                message = f"workdir rejected: {exc}: {shown}"
+                message = f"invalid workdir: {exc}"
                 body = f"<p>{html.escape(message)}</p><p><a href='/'>Back</a></p>".encode("utf-8")
                 self._send(400, "text/html; charset=utf-8", body, None)
                 return
@@ -453,6 +452,10 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
     requested = _nested(packet, "model", "requested")
     actual = _nested(packet, "model", "actual")
     mismatch = bool(requested) and isinstance(actual, str) and actual != requested
+    workdir_trust = (
+        status == "needs-approval"
+        and app.store.read_meta(packet_id).get("pending_kind") == "workdir"
+    )
     parts = [
         "<article class='card'",
         f" data-id='{html.escape(packet_id)}'",
@@ -463,7 +466,7 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         f"<p class='from'>From: {html.escape(sender)}</p>",
         f"<p>Project: {html.escape(project)}</p>",
         _folder_line(app, packet),
-        f"<p>Status: {html.escape(_visible_status(status, _nested_result(packet, 'blocked_reason')))}</p>",
+        f"<p>Status: {html.escape(_visible_status(status, _nested_result(packet, 'blocked_reason'), workdir_trust=workdir_trust))}</p>",
         "<p class='model'>requested <span data-model-requested='",
         html.escape("" if requested is None else str(requested)),
         "'>",
@@ -498,7 +501,7 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         meta = app.store.read_meta(packet_id)
         command = str(meta.get("pending_command") or _pending_command(packet))
         diff = str(meta.get("pending_diff") or "")
-        title = approval_title(command)
+        title = "Use this folder" if workdir_trust else approval_title(command)
         parts.append(f"<h3 class='approval-title'>{html.escape(title)}</h3>")
         parts.append(_folder_line(app, packet))
         parts.append(f"<pre class='command'>{html.escape(command)}</pre>")
@@ -570,7 +573,9 @@ def _page_end() -> str:
     return "</body></html>"
 
 
-def _visible_status(status: str, reason: object) -> str:
+def _visible_status(status: str, reason: object, *, workdir_trust: bool = False) -> str:
+    if status == "needs-approval" and workdir_trust:
+        return "Needs you"
     if status == "blocked" and isinstance(reason, str) and reason.startswith("Needs you"):
         return "Needs you"
     return status

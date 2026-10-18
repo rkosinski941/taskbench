@@ -1,4 +1,4 @@
-"""The 12 Enjoy breakage scenarios. One class per scenario."""
+"""The 13 Enjoy breakage scenarios. One class per scenario."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from taskbench.process_tree import pid_alive
 from taskbench.state import StateStore
 from taskbench.task_format import parse_yaml
 from taskbench.ui.server import TaskbenchServer
+from taskbench.workdir import is_registered, load_registry
 from tests.support import TempApp, base_packet, command_write_marker, packet_status, run_until, write_packet
 
 
@@ -513,6 +514,71 @@ class PreviewsNeverRenderRemotely(TempApp):
         self.assertIn("/artifact/files-1/canvas-v2.html", done_body)
         self.assertNotIn("<iframe", done_body.lower())
         self.assertNotIn("busy", done_body.lower())
+
+
+class BotWorkdirTrust(TempApp):
+    """Breakage 13: an unregistered bot folder waits; a bad path is blocked."""
+
+    def _folder(self) -> Path:
+        path = self.root / "chosen-folder"
+        path.mkdir()
+        (path / "INSTRUCTIONS.md").write_text("WORKDIR-INSTRUCTIONS-TOKEN\n", encoding="utf-8")
+        return path
+
+    def test_unregistered_needs_you_and_rejected_path_is_blocked(self) -> None:
+        _config, app, watcher = self.make(scenario="read-ok", can_ask=False)
+        folder = self._folder()
+        rejected = base_packet(id="bad-dir", permissions="plan", timeout_s=30)
+        rejected["workdir"] = str(self.root / "missing-folder")
+        write_packet(self.store.inbox, rejected)
+        run_until(watcher, lambda: packet_status(self.store, "bad-dir") == "blocked")
+        saved_bad = parse_yaml(_read(self.store.outbox / "bad-dir.yaml"))
+        self.assertEqual(saved_bad["result"]["blocked_reason"], "invalid workdir")
+        self.assertEqual(load_registry(self.root / "var"), [])
+
+        packet = base_packet(id="bot-dir", permissions="plan", timeout_s=30)
+        packet["workdir"] = str(folder)
+        write_packet(self.store.inbox, packet)
+        run_until(watcher, lambda: packet_status(self.store, "bot-dir") == "needs-approval")
+        waiting = parse_yaml(_read(self.store.needs_approval / "bot-dir.yaml"))
+        resolved = str(folder.resolve())
+        self.assertEqual(waiting["status"], "needs-approval")
+        self.assertEqual(waiting["workdir"], resolved)
+        self.assertFalse(is_registered(self.root / "var", folder.resolve()))
+        self.assertFalse((folder / ".taskbench" / "LAST_AGENT.md").exists())
+
+        server = TaskbenchServer(app, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.server = server
+        conn = http.client.HTTPConnection("127.0.0.1", int(server.server_address[1]), timeout=5)
+        conn.request("GET", "/task/bot-dir")
+        page = conn.getresponse().read().decode("utf-8")
+        conn.close()
+        self.assertIn("Needs you", page)
+        self.assertIn("data-status='needs-approval'", page)
+        self.assertIn(resolved, page)
+        self.assertIn("Use this folder", page)
+
+        watcher.request_decision("bot-dir", "denied")
+        run_until(watcher, lambda: packet_status(self.store, "bot-dir") == "blocked")
+        denied = parse_yaml(_read(self.store.outbox / "bot-dir.yaml"))
+        self.assertEqual(denied["result"]["blocked_reason"], "refused workdir")
+        self.assertFalse(is_registered(self.root / "var", folder.resolve()))
+
+        again = base_packet(id="bot-dir-2", permissions="plan", timeout_s=30)
+        again["workdir"] = str(folder)
+        write_packet(self.store.inbox, again)
+        run_until(watcher, lambda: packet_status(self.store, "bot-dir-2") == "needs-approval")
+        watcher.request_decision("bot-dir-2", "approved")
+        run_until(watcher, lambda: packet_status(self.store, "bot-dir-2") == "done")
+        self.assertTrue(is_registered(self.root / "var", folder.resolve()))
+        handoff = _read(folder / ".taskbench" / "LAST_AGENT.md")
+        self.assertIn("bot-dir-2", handoff)
+        self.assertFalse((self.root / "projects" / "demo-canvas" / ".taskbench" / "LAST_AGENT.md").exists())
+        prompt = _read(self.store.outbox / "bot-dir-2.prompt.md")
+        self.assertIn("WORKDIR-INSTRUCTIONS-TOKEN", prompt)
+        self.assertIn(resolved, prompt)
 
 
 if __name__ == "__main__":

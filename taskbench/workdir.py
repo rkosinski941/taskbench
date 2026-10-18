@@ -57,6 +57,10 @@ class WorkdirError(ValueError):
         self.resolved = resolved
 
 
+class WorkdirTrustError(WorkdirError):
+    """A valid folder that this sender has not been allowed to use."""
+
+
 def validate_workdir(raw: str) -> Path:
     """Resolve ``raw`` and reject roots, the profile, and system folders."""
     if not isinstance(raw, str) or not raw.strip():

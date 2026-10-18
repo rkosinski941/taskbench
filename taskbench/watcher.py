@@ -48,7 +48,13 @@ from taskbench.projects import (
     retro_followup_prompt,
     write_last_agent,
 )
-from taskbench.workdir import WorkdirError, is_registered, register_workdir, validate_workdir
+from taskbench.workdir import (
+    WorkdirError,
+    WorkdirTrustError,
+    is_registered,
+    register_workdir,
+    validate_workdir,
+)
 from taskbench.safety import (
     classify,
     execute_readonly,
@@ -221,8 +227,12 @@ class Watcher:
         packet_id = str(packet["id"])
         try:
             folder = self._resolve_run_folder(packet)
+        except WorkdirTrustError as exc:
+            self._enter_workdir_approval(packet, str(exc.resolved or packet.get("workdir") or ""))
+            return "needs-approval"
         except WorkdirError as exc:
-            self._publish_blocked(packet, str(exc))
+            reason = "invalid workdir" if _has_workdir(packet) else str(exc)
+            self._publish_blocked(packet, reason)
             return "blocked"
         requested = str((packet.get("runner") or {}).get("requested") or "")
         adapter = get_adapter(requested, self.config)
@@ -298,9 +308,15 @@ class Watcher:
                 f"refusing to run without process confinement: {exc}",
                 killed=True,
             )
-        self.deadline = time.monotonic() + timeout_s
+        previous_meta = self.store.read_meta(packet_id)
+        carry_clock = previous_meta.get("pending_kind") == "workdir" and isinstance(
+            previous_meta.get("started_epoch"), (int, float)
+        )
+        started = float(previous_meta["started_epoch"]) if carry_clock else time.time()
+        remaining = timeout_s - (time.time() - started) if carry_clock else float(timeout_s)
+        self.deadline = time.monotonic() + max(0.1, remaining)
         meta = {
-            "started_epoch": time.time(),
+            "started_epoch": started,
             "timeout_s": timeout_s,
             "pid": self.proc.pid,
             "pgid": self.proc.group_id,
@@ -786,6 +802,8 @@ class Watcher:
             reason = "cancelled" if status == "blocked" else self._timeout_reason(packet)
             self._finish_without_process(packet, status, reason, killed=True)
             return status
+        if self.store.read_meta(packet_id).get("pending_kind") == "workdir":
+            return self._service_workdir_approval(packet)
         decision = self.store.read_meta(packet_id).get("decision")
         if decision is None:
             return "needs-approval"
@@ -858,26 +876,24 @@ class Watcher:
 
         A ``workdir`` is resolved before it is accepted. Bots cannot add a
         folder to the registry. ``web-ui`` can. An unregistered bot path is
-        ``Needs you`` and is not stored as an accepted folder.
+        ``needs-approval`` (the page shows Needs you) and is not stored until
+        the owner approves it. A rejected path is ``invalid workdir``.
         """
         raw = packet.get("workdir")
         if isinstance(raw, str) and raw.strip():
             try:
                 folder = validate_workdir(raw)
             except WorkdirError as exc:
-                shown = exc.resolved or raw.strip()
                 if exc.resolved:
                     packet["workdir"] = exc.resolved
-                raise WorkdirError(f"workdir rejected: {exc}: {shown}", exc.resolved) from exc
+                raise WorkdirError("invalid workdir", exc.resolved) from exc
             packet["workdir"] = str(folder)
             sender = str(packet.get("from") or "")
             if sender == "web-ui":
                 register_workdir(self.config.data_dir, folder)
             elif not is_registered(self.config.data_dir, folder):
-                raise WorkdirError(
-                    "Needs you: workdir is not registered. "
-                    "Choose this folder in the web UI before a bot can use it: "
-                    + str(folder),
+                raise WorkdirTrustError(
+                    "Needs you: workdir is not registered: " + str(folder),
                     str(folder),
                 )
             return folder
@@ -885,6 +901,63 @@ class Watcher:
         if not folder.is_dir():
             raise WorkdirError("unknown project")
         return folder
+
+    def _enter_workdir_approval(self, packet: dict[str, Any], folder: str) -> None:
+        """Park a bot folder until the owner accepts it. Do not register it."""
+        packet_id = str(packet["id"])
+        packet["workdir"] = folder
+        packet["status"] = "needs-approval"
+        approvals = list(packet.get("approvals") or [])
+        approvals.append({"at": now_iso(), "command": folder, "decision": "pending"})
+        packet["approvals"] = approvals
+        timeout_s = int(packet.get("timeout_s") or 900)
+        self.store.write_meta(
+            packet_id,
+            {
+                "started_epoch": time.time(),
+                "timeout_s": timeout_s,
+                "cancel": False,
+                "decision": None,
+                "pending_kind": "workdir",
+                "pending_command": folder,
+                "pending_workdir": folder,
+            },
+        )
+        self.store.move_packet(
+            "claimed",
+            "needs-approval",
+            packet,
+            f"{packet_id} claimed -> needs-approval (workdir)",
+        )
+
+    def _service_workdir_approval(self, packet: dict[str, Any]) -> str:
+        packet_id = str(packet["id"])
+        decision = self.store.read_meta(packet_id).get("decision")
+        if decision is None:
+            return "needs-approval"
+        folder_text = str(
+            self.store.read_meta(packet_id).get("pending_workdir") or packet.get("workdir") or ""
+        )
+        if decision != "approved":
+            self._mark_decision(packet, "denied")
+            self._finish_without_process(packet, "blocked", "refused workdir", killed=True)
+            return "blocked"
+        try:
+            folder = validate_workdir(folder_text)
+        except WorkdirError:
+            self._finish_without_process(packet, "blocked", "invalid workdir", killed=True)
+            return "blocked"
+        register_workdir(self.config.data_dir, folder)
+        packet["workdir"] = str(folder)
+        self._mark_decision(packet, "approved")
+        packet["status"] = "claimed"
+        self.store.move_packet(
+            "needs-approval",
+            "claimed",
+            packet,
+            f"{packet_id} workdir approved",
+        )
+        return self._start(packet)
 
     def _handoff_folder(self, packet: dict[str, Any]) -> Path | None:
         raw = packet.get("workdir")
@@ -1019,6 +1092,11 @@ class Watcher:
         if self.deadline is None:
             return 30
         return max(0.1, self.deadline - time.monotonic())
+
+
+def _has_workdir(packet: dict[str, Any]) -> bool:
+    raw = packet.get("workdir")
+    return isinstance(raw, str) and bool(raw.strip())
 
 
 def _model_requested(packet: dict[str, Any]) -> str | None:

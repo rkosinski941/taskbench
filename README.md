@@ -268,8 +268,10 @@ on POSIX.
 A task with `from: web-ui` may use a new valid folder. taskbench stores
 the resolved path in its data directory (`workdir-registry.json`), not in
 the repo. Any other sender may use only a folder already in that registry.
-An unregistered bot path is `blocked`, shown as **Needs you**, with the
-resolved path in the message, and it is not added to the registry.
+An unregistered bot path is `needs-approval`, shown as **Needs you**, with
+the resolved path on the task. It is not added to the registry until the
+owner approves that folder. A rejected path is `blocked` with reason
+`invalid workdir`.
 
 See `docs/SPEC-ADDITIONS.md`.
 
