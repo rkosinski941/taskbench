@@ -24,7 +24,8 @@ ship a real `grok` binary, and these tests do not launch one.
   and `--prompt-file` for a prompt file. Both trigger headless mode. There
   is no `--prompt` flag. `--cwd` sets the working directory when you run
   Grok yourself. taskbench starts the process in the confirmed workdir and
-  rejects `--cwd`, `-c`, and `--config` in `args_template`. taskbench's
+  rejects `--cwd`, `-c`, and `--config` in `args_template`. It rejects
+  `--agent` because taskbench does not pass `--agent`. taskbench's
   example `args_template` passes `--prompt-file` and `{prompt_file}`. The
   flag name is that config string. If `grok --help` prints a different
   prompt-file flag, change the string. No code change.

@@ -216,6 +216,29 @@ class ExecScanTests(unittest.TestCase):
             (empty / ".claude" / "settings.json").write_text(body, encoding="utf-8")
             self.assertEqual(scan_project_permission_rules(empty), [])
 
+    def test_claude_extra_known_marketplaces_need_you(self) -> None:
+        project = self._project()
+        (project / ".claude").mkdir()
+        (project / ".claude" / "settings.json").write_text(
+            '{"extraKnownMarketplaces":{"my-market":{"source":"github"}}}\n',
+            encoding="utf-8",
+        )
+        message = needs_you_message(scan_project_permission_rules(project))
+        self.assertIn(".claude/settings.json", message)
+        self.assertIn("extra_known_marketplaces", message)
+        self.assertIn("extra known marketplaces", message)
+        self.assertNotIn("my-market", message)
+        self.assertNotIn("github", message)
+        for body in (
+            '{"extraKnownMarketplaces":{}}\n',
+            '{"extraKnownMarketplaces":false}\n',
+            '{"extraKnownMarketplaces":""}\n',
+        ):
+            empty = self._project()
+            (empty / ".claude").mkdir()
+            (empty / ".claude" / "settings.json").write_text(body, encoding="utf-8")
+            self.assertEqual(scan_project_permission_rules(empty), [])
+
 
 class PromptFlagTests(unittest.TestCase):
     def test_prompt_file_flag_comes_from_the_runner_config(self) -> None:
@@ -264,6 +287,22 @@ class PromptFlagTests(unittest.TestCase):
                 self.assertIn(flag.split("=", 1)[0].lower(), str(caught.exception))
                 self.assertIn("working directory", str(caught.exception))
 
+    def test_args_template_rejects_agent_flag(self) -> None:
+        text = (ROOT / "config.example.json").read_text(encoding="utf-8")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for flag in ("--agent", "--Agent", "--agent=name"):
+            target = Path(tmp.name) / "config.json"
+            target.write_text(
+                text.replace('"--prompt-file"', f'"{flag}", "--prompt-file"', 1),
+                encoding="utf-8",
+            )
+            with self.subTest(flag=flag):
+                with self.assertRaises(ConfigError) as caught:
+                    load_config(target)
+                self.assertIn("--agent", str(caught.exception))
+                self.assertIn("does not pass --agent", str(caught.exception))
+
 
 class LaptopProbeScriptTests(unittest.TestCase):
     def test_script_and_plan_do_not_delete_real_settings(self) -> None:
@@ -282,7 +321,13 @@ class LaptopProbeScriptTests(unittest.TestCase):
         self.assertIn("# END TASKBENCH-PROBE", script)
         self.assertIn("UTF8Encoding($false)", script)
         self.assertIn("[System.IO.File]::WriteAllText", script)
-        self.assertIn("ConvertFrom-Json", script)
+        self.assertNotIn("ConvertFrom-Json", script)
+        self.assertNotIn("ConvertTo-Json", script)
+        self.assertIn("System.Text.Json", script)
+        self.assertIn("JsonDocument", script)
+        self.assertIn("PowerShell 7", script)
+        self.assertIn("recommended", script)
+        self.assertIn("other content", script)
         self.assertIn("Bash(echo TASKBENCH-PROBE*)", script)
         self.assertIn("taskbench-created", script)
         self.assertIn(".used", script)
@@ -299,7 +344,11 @@ class LaptopProbeScriptTests(unittest.TestCase):
             if "Copy-Item" in line:
                 self.assertNotIn("-Force", line)
         self.assertIn("-DryRun", script)
-        self.assertIn("ConvertFrom-Json", plan)
+        self.assertNotIn("ConvertFrom-Json", plan)
+        self.assertNotIn("5.1", plan)
+        self.assertIn("PowerShell 7 is supported and recommended", plan)
+        self.assertIn("System.Text.Json", plan)
+        self.assertIn("other content", plan)
         self.assertIn("taskbench-created", plan)
         self.assertIn(".used", plan)
         self.assertIn("laptop-probe.ps1", plan)
@@ -333,9 +382,15 @@ class LaptopProbeScriptTests(unittest.TestCase):
             self.skipTest("the probe script runs under Windows PowerShell")
         if Path(r"C:\taskbench-probe").exists():
             self.skipTest("C:\\taskbench-probe already exists")
-        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
-        if powershell is None:
-            self.skipTest("powershell is not on PATH")
+        requested = os.environ.get("TASKBENCH_PROBE_POWERSHELL", "").strip()
+        if requested:
+            powershell = shutil.which(requested)
+            if powershell is None:
+                self.fail(f"{requested} is not on PATH")
+        else:
+            powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+            if powershell is None:
+                self.skipTest("powershell is not on PATH")
         scratch = ROOT / "test-scratch"
         scratch.mkdir(exist_ok=True)
         tmp = tempfile.TemporaryDirectory(dir=scratch)
@@ -608,4 +663,91 @@ class LaptopProbeScriptTests(unittest.TestCase):
         claude.write_bytes(raw)
         self.assertEqual(self._probe(powershell, profile, "-Cleanup").returncode, 0)
         self.assertEqual(claude.read_bytes(), raw)
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_i_dates_numbers_and_nesting_survive_cleanup(self) -> None:
+        powershell, profile = self._probe_profile()
+        claude = profile / ".claude" / "settings.json"
+        claude.parent.mkdir()
+        original = (
+            '{"created":"2024-01-02T03:04:05.1234567Z","when":"2024-01-02T03:04:05Z",'
+            '"count":1.0,"big":9007199254740993,"signed":-2.50,'
+            '"level":{"items":[1,{"when":"2020-12-31T00:00:00.000Z","inner":{"n":1.0}}]},'
+            '"permissions":{"allow":["Bash(git status)","Bash(echo TASKBENCH-PROBE*)","Bash(git diff)"]},'
+            '"note":"keep"}\n'
+        )
+        claude.write_text(original, encoding="utf-8", newline="\n")
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        expected = (
+            '{"created":"2024-01-02T03:04:05.1234567Z","when":"2024-01-02T03:04:05Z",'
+            '"count":1.0,"big":9007199254740993,"signed":-2.50,'
+            '"level":{"items":[1,{"when":"2020-12-31T00:00:00.000Z","inner":{"n":1.0}}]},'
+            '"permissions":{"allow":["Bash(git status)","Bash(git diff)"]},'
+            '"note":"keep"}\n'
+        )
+        self.assertEqual(claude.read_bytes(), expected.encode("utf-8"))
+        crlf = (
+            "{\r\n"
+            '  "created": "2024-01-02T03:04:05Z",\r\n'
+            '  "count": 1.0,\r\n'
+            "  \"permissions\": {\r\n"
+            '    "allow": ["Bash(git status)", "Bash(echo TASKBENCH-PROBE*)", "Bash(git diff)"]\r\n'
+            "  }\r\n"
+            "}\r\n"
+        ).encode("utf-8")
+        claude.write_bytes(crlf)
+        cleaned_crlf = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned_crlf.returncode, 0, cleaned_crlf.stderr + cleaned_crlf.stdout)
+        expected_crlf = (
+            "{\r\n"
+            '  "created": "2024-01-02T03:04:05Z",\r\n'
+            '  "count": 1.0,\r\n'
+            "  \"permissions\": {\r\n"
+            '    "allow": ["Bash(git status)", "Bash(git diff)"]\r\n'
+            "  }\r\n"
+            "}\r\n"
+        ).encode("utf-8")
+        self.assertEqual(claude.read_bytes(), expected_crlf)
+        planted_source = '{"created":"2024-01-02T03:04:05Z","count":1.0,"nested":{"keep":true}}\n'
+        claude.write_text(planted_source, encoding="utf-8", newline="\n")
+        backed = self._probe(powershell, profile, "-Backup")
+        self.assertEqual(backed.returncode, 0, backed.stderr + backed.stdout)
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "claude")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        self.assertEqual(
+            claude.read_bytes(),
+            (
+                '{"created":"2024-01-02T03:04:05Z","count":1.0,"nested":{"keep":true},'
+                '"permissions":{"allow":["Bash(echo TASKBENCH-PROBE*)"]}}\n'
+            ).encode("utf-8"),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "the probe script runs under Windows PowerShell")
+    def test_j_leftover_created_marker_keeps_real_content(self) -> None:
+        powershell, profile = self._probe_profile()
+        planted = self._probe(powershell, profile, "-Plant", "-Which", "claude")
+        self.assertEqual(planted.returncode, 0, planted.stderr + planted.stdout)
+        claude = profile / ".claude" / "settings.json"
+        sidecar = Path(str(claude) + ".taskbench-created")
+        self.assertTrue(claude.is_file())
+        self.assertTrue(sidecar.is_file())
+        edited = (
+            '{"model":"owner-edit","created":"2024-01-02T03:04:05Z",'
+            '"permissions":{"allow":["Bash(echo TASKBENCH-PROBE*)","Bash(git status)"]}}\n'
+        )
+        claude.write_text(edited, encoding="utf-8", newline="\n")
+        cleaned = self._probe(powershell, profile, "-Cleanup")
+        self.assertEqual(cleaned.returncode, 0, cleaned.stderr + cleaned.stdout)
+        self.assertTrue(claude.is_file())
+        self.assertFalse(sidecar.exists())
+        self.assertIn("created-file marker", cleaned.stdout)
+        self.assertIn("other content", cleaned.stdout)
+        self.assertEqual(
+            claude.read_bytes(),
+            (
+                '{"model":"owner-edit","created":"2024-01-02T03:04:05Z",'
+                '"permissions":{"allow":["Bash(git status)"]}}\n'
+            ).encode("utf-8"),
+        )
 

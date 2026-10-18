@@ -14,11 +14,16 @@
 #
 # TOML is removed only between the comment lines
 # "# BEGIN TASKBENCH-PROBE" and "# END TASKBENCH-PROBE". JSON has no
-# comments, so cleanup parses with ConvertFrom-Json and removes the exact
-# rule string from permissions.allow. An allow array or permissions object
+# comments. The exact rule string is spliced out of permissions.allow.
+# Dates, numbers, key order, and nested values are not rewritten.
+# PowerShell 7 is the primary host: System.Text.Json JsonDocument checks
+# the edited JSON. The same splice runs on Windows PowerShell 5.1, which
+# does not ship System.Text.Json. An allow array or permissions object
 # that this script added is dropped when it is empty afterwards. The file
 # is deleted only when a sidecar "<file>.taskbench-created" exists and the
-# file contains nothing but the probe rule. That sidecar is written only
+# file contains nothing but the probe rule. If that sidecar is left over
+# and the file has other content, cleanup removes the probe rule, deletes
+# the sidecar, keeps the file, and says so. The sidecar is written only
 # when the live file did not exist before -Plant.
 #
 # Probe text is the marker comments or the exact rule string. This script
@@ -34,8 +39,9 @@
 #
 # -DryRun prints the actions and does not write.
 #
-# PowerShell 5.1 Set-Content -Encoding utf8 writes a BOM. This script uses
-# UTF-8 without a BOM.
+# PowerShell 7 is supported and recommended. Windows PowerShell 5.1 still
+# runs this script. Set-Content -Encoding utf8 writes a BOM on 5.1, so this
+# script uses UTF-8 without a BOM on both.
 
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -103,181 +109,352 @@ function Get-Newline {
     return "`n"
 }
 
-function ConvertTo-JsonString {
-    param([string] $Text)
-    $builder = New-Object System.Text.StringBuilder
-    [void]$builder.Append('"')
-    foreach ($char in $Text.ToCharArray()) {
-        $code = [int]$char
-        if ($code -eq 34) {
-            [void]$builder.Append('\"')
-        } elseif ($code -eq 92) {
-            [void]$builder.Append('\\')
-        } elseif ($code -eq 8) {
-            [void]$builder.Append('\b')
-        } elseif ($code -eq 9) {
-            [void]$builder.Append('\t')
-        } elseif ($code -eq 10) {
-            [void]$builder.Append('\n')
-        } elseif ($code -eq 12) {
-            [void]$builder.Append('\f')
-        } elseif ($code -eq 13) {
-            [void]$builder.Append('\r')
-        } elseif ($code -lt 32) {
-            [void]$builder.Append(('\\u{0:x4}' -f $code))
+function Skip-JsonWhitespace {
+    while ($script:JsonIndex -lt $script:JsonLength) {
+        $char = $script:JsonText[$script:JsonIndex]
+        if ($char -eq ' ' -or $char -eq "`t" -or $char -eq "`n" -or $char -eq "`r") {
+            $script:JsonIndex += 1
         } else {
-            [void]$builder.Append($char)
+            break
         }
     }
-    [void]$builder.Append('"')
-    return $builder.ToString()
 }
 
-function Write-JsonValue {
-    # [object[]] plus a unary comma keeps a one-element array intact.
-    # An untyped parameter would unwrap it and turn ["rule"] into a string.
-    param([object[]]$Wrapped)
-    if ($null -eq $Wrapped -or $Wrapped.Count -eq 0) {
-        return "null"
+function Peek-JsonChar {
+    if ($script:JsonIndex -ge $script:JsonLength) {
+        return [char]0
     }
-    $InputObject = $Wrapped[0]
-    if ($null -eq $InputObject) {
-        return "null"
-    }
-    if ($InputObject -is [string]) {
-        return (ConvertTo-JsonString -Text $InputObject)
-    }
-    if ($InputObject -is [bool]) {
-        if ($InputObject) { return "true" }
-        return "false"
-    }
-    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($prop in $InputObject.PSObject.Properties) {
-            $name = ConvertTo-JsonString -Text ([string]$prop.Name)
-            $child = Write-JsonValue -Wrapped (, $prop.Value)
-            $parts.Add("${name}:${child}")
+    return $script:JsonText[$script:JsonIndex]
+}
+
+function Read-JsonString {
+    $start = $script:JsonIndex
+    $script:JsonIndex += 1
+    $builder = New-Object System.Text.StringBuilder
+    while ($script:JsonIndex -lt $script:JsonLength) {
+        $char = $script:JsonText[$script:JsonIndex]
+        if ($char -eq '"') {
+            $script:JsonIndex += 1
+            return @{ Kind = "string"; Start = $start; End = $script:JsonIndex; Value = $builder.ToString() }
         }
-        return "{" + ($parts -join ",") + "}"
-    }
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($key in $InputObject.Keys) {
-            $name = ConvertTo-JsonString -Text ([string]$key)
-            $child = Write-JsonValue -Wrapped (, $InputObject[$key])
-            $parts.Add("${name}:${child}")
+        if ($char -eq '\') {
+            $script:JsonIndex += 1
+            if ($script:JsonIndex -ge $script:JsonLength) { throw "bad JSON escape" }
+            $escaped = $script:JsonText[$script:JsonIndex]
+            $script:JsonIndex += 1
+            if ($escaped -eq '"') { [void]$builder.Append('"') }
+            elseif ($escaped -eq '\') { [void]$builder.Append('\') }
+            elseif ($escaped -eq '/') { [void]$builder.Append('/') }
+            elseif ($escaped -eq 'b') { [void]$builder.Append([char]8) }
+            elseif ($escaped -eq 'f') { [void]$builder.Append([char]12) }
+            elseif ($escaped -eq 'n') { [void]$builder.Append("`n") }
+            elseif ($escaped -eq 'r') { [void]$builder.Append("`r") }
+            elseif ($escaped -eq 't') { [void]$builder.Append("`t") }
+            elseif ($escaped -eq 'u') {
+                if (($script:JsonIndex + 4) -gt $script:JsonLength) { throw "bad JSON unicode escape" }
+                $hex = $script:JsonText.Substring($script:JsonIndex, 4)
+                $script:JsonIndex += 4
+                $codePoint = 0
+                $parsedHex = [int]::TryParse(
+                    $hex,
+                    [System.Globalization.NumberStyles]::HexNumber,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$codePoint
+                )
+                if (-not $parsedHex) { throw "bad JSON unicode escape" }
+                [void]$builder.Append([char]$codePoint)
+            }
+            else { throw "bad JSON escape" }
+        } else {
+            [void]$builder.Append($char)
+            $script:JsonIndex += 1
         }
-        return "{" + ($parts -join ",") + "}"
     }
-    $isList = ($InputObject -is [System.Array]) -or ($InputObject -is [System.Collections.IList])
-    if ($isList) {
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($item in $InputObject) {
-            $parts.Add((Write-JsonValue -Wrapped (, $item)))
+    throw "unterminated JSON string"
+}
+
+function Read-JsonLiteral {
+    param([string] $Literal, [string] $Kind)
+    if (-not $script:JsonText.Substring($script:JsonIndex).StartsWith($Literal)) {
+        throw "expected $Literal"
+    }
+    $start = $script:JsonIndex
+    $script:JsonIndex += $Literal.Length
+    return @{ Kind = $Kind; Start = $start; End = $script:JsonIndex; Value = $Literal }
+}
+
+function Read-JsonNumber {
+    $start = $script:JsonIndex
+    if ((Peek-JsonChar) -eq '-') { $script:JsonIndex += 1 }
+    while ($script:JsonIndex -lt $script:JsonLength) {
+        $char = $script:JsonText[$script:JsonIndex]
+        if ($char -eq ',' -or $char -eq ']' -or $char -eq '}' -or $char -eq ' ' -or $char -eq "`t" -or $char -eq "`n" -or $char -eq "`r") {
+            break
         }
-        return "[" + ($parts -join ",") + "]"
+        $script:JsonIndex += 1
     }
-    if ($InputObject -is [ValueType]) {
-        return [System.Convert]::ToString($InputObject, [System.Globalization.CultureInfo]::InvariantCulture)
+    if ($script:JsonIndex -le $start -or ($script:JsonText[$start] -eq '-' -and $script:JsonIndex -eq ($start + 1))) {
+        throw "bad JSON number"
     }
-    throw "cannot write JSON for $($InputObject.GetType().FullName)"
+    return @{ Kind = "number"; Start = $start; End = $script:JsonIndex; Value = $script:JsonText.Substring($start, $script:JsonIndex - $start) }
+}
+
+function Read-JsonValue {
+    Skip-JsonWhitespace
+    if ($script:JsonIndex -ge $script:JsonLength) { throw "unexpected end of JSON" }
+    $char = Peek-JsonChar
+    if ($char -eq '{') { return Read-JsonObject }
+    if ($char -eq '[') { return Read-JsonArray }
+    if ($char -eq '"') { return Read-JsonString }
+    if ($char -eq 't') { return Read-JsonLiteral -Literal "true" -Kind "bool" }
+    if ($char -eq 'f') { return Read-JsonLiteral -Literal "false" -Kind "bool" }
+    if ($char -eq 'n') { return Read-JsonLiteral -Literal "null" -Kind "null" }
+    if ($char -eq '-' -or (($char -ge '0') -and ($char -le '9'))) { return Read-JsonNumber }
+    throw "unexpected JSON at index $($script:JsonIndex)"
 }
 
 function Read-JsonObject {
-    param([string] $Text, [string] $Path)
-    try {
-        $parsed = $Text | ConvertFrom-Json
-    } catch {
-        throw "could not parse $Path as JSON"
+    $start = $script:JsonIndex
+    $script:JsonIndex += 1
+    $properties = New-Object System.Collections.Generic.List[object]
+    Skip-JsonWhitespace
+    if ((Peek-JsonChar) -eq '}') {
+        $script:JsonIndex += 1
+        return @{ Kind = "object"; Start = $start; End = $script:JsonIndex; Properties = $properties }
     }
-    if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
-        throw "refusing to change $Path because the JSON root is not an object"
+    while ($true) {
+        Skip-JsonWhitespace
+        if ((Peek-JsonChar) -ne '"') { throw "expected a JSON property name" }
+        $name = Read-JsonString
+        Skip-JsonWhitespace
+        if ((Peek-JsonChar) -ne ':') { throw "expected a colon" }
+        $script:JsonIndex += 1
+        $value = Read-JsonValue
+        $properties.Add(@{ Name = $name.Value; NameStart = $name.Start; NameEnd = $name.End; Value = $value })
+        Skip-JsonWhitespace
+        $char = Peek-JsonChar
+        if ($char -eq ',') {
+            $script:JsonIndex += 1
+            continue
+        }
+        if ($char -eq '}') {
+            $script:JsonIndex += 1
+            break
+        }
+        throw "expected a comma or the end of an object"
     }
-    return $parsed
+    return @{ Kind = "object"; Start = $start; End = $script:JsonIndex; Properties = $properties }
 }
 
-function Get-AllowItems {
-    param($Parsed)
-    $permProp = $Parsed.PSObject.Properties['permissions']
-    if ($null -eq $permProp -or $null -eq $permProp.Value) {
-        return @()
+function Read-JsonArray {
+    $start = $script:JsonIndex
+    $script:JsonIndex += 1
+    $elements = New-Object System.Collections.Generic.List[object]
+    Skip-JsonWhitespace
+    if ((Peek-JsonChar) -eq ']') {
+        $script:JsonIndex += 1
+        return @{ Kind = "array"; Start = $start; End = $script:JsonIndex; Elements = $elements }
     }
-    if ($permProp.Value -isnot [System.Management.Automation.PSCustomObject]) {
-        return @()
+    while ($true) {
+        $value = Read-JsonValue
+        $elements.Add($value)
+        Skip-JsonWhitespace
+        $char = Peek-JsonChar
+        if ($char -eq ',') {
+            $script:JsonIndex += 1
+            continue
+        }
+        if ($char -eq ']') {
+            $script:JsonIndex += 1
+            break
+        }
+        throw "expected a comma or the end of an array"
     }
-    $allowProp = $permProp.Value.PSObject.Properties['allow']
-    if ($null -eq $allowProp) {
-        return @()
-    }
-    return @($allowProp.Value)
+    return @{ Kind = "array"; Start = $start; End = $script:JsonIndex; Elements = $elements }
 }
 
-function Test-JsonHasProbeRule {
-    param($Parsed)
-    foreach ($item in @(Get-AllowItems -Parsed $Parsed)) {
-        if (($item -is [string]) -and ($item -ceq $script:ProbeRule)) {
-            return $true
+function Parse-JsonRoot {
+    param([string] $Text)
+    $script:JsonText = $Text
+    $script:JsonIndex = 0
+    $script:JsonLength = $Text.Length
+    $root = Read-JsonValue
+    Skip-JsonWhitespace
+    if ($script:JsonIndex -ne $script:JsonLength) { throw "trailing data after JSON" }
+    if ($root.Kind -ne "object") { throw "JSON root is not an object" }
+    return $root
+}
+
+function Find-PermissionsAllow {
+    param($Root)
+    for ($index = 0; $index -lt $Root.Properties.Count; $index++) {
+        $property = $Root.Properties[$index]
+        if ($property.Name -cne "permissions" -or $property.Value.Kind -ne "object") { continue }
+        $children = $property.Value.Properties
+        for ($childIndex = 0; $childIndex -lt $children.Count; $childIndex++) {
+            if ($children[$childIndex].Name -ceq "allow") {
+                return @{
+                    Permissions = $property
+                    Allow = $children[$childIndex]
+                    AllowIndex = $childIndex
+                }
+            }
         }
     }
-    return $false
+    return $null
 }
 
-function Test-JsonOnlyProbe {
-    param($Parsed)
-    $props = @($Parsed.PSObject.Properties)
-    if ($props.Count -ne 1 -or $props[0].Name -cne "permissions") {
-        return $false
+function Test-JsonOnlyProbeNode {
+    param($Root)
+    if ($Root.Properties.Count -ne 1 -or $Root.Properties[0].Name -cne "permissions") { return $false }
+    $permissions = $Root.Properties[0].Value
+    if ($permissions.Kind -ne "object" -or $permissions.Properties.Count -ne 1) { return $false }
+    $allow = $permissions.Properties[0]
+    if ($allow.Name -cne "allow") { return $false }
+    if ($allow.Value.Kind -eq "string") {
+        return $allow.Value.Value -ceq $script:ProbeRule
     }
-    $perm = $props[0].Value
-    if ($null -eq $perm -or $perm -isnot [System.Management.Automation.PSCustomObject]) {
-        return $false
-    }
-    $permProps = @($perm.PSObject.Properties)
-    if ($permProps.Count -ne 1 -or $permProps[0].Name -cne "allow") {
-        return $false
-    }
-    $items = @($permProps[0].Value)
-    if ($items.Count -ne 1) {
-        return $false
-    }
-    return ($items[0] -is [string]) -and ($items[0] -ceq $script:ProbeRule)
+    if ($allow.Value.Kind -ne "array" -or $allow.Value.Elements.Count -ne 1) { return $false }
+    $element = $allow.Value.Elements[0]
+    return ($element.Kind -eq "string") -and ($element.Value -ceq $script:ProbeRule)
 }
 
-function Remove-JsonProbeRule {
-    param($Parsed)
-    $permProp = $Parsed.PSObject.Properties['permissions']
-    if ($null -eq $permProp -or $null -eq $permProp.Value) {
-        return $false
+function Remove-ObjectProperty {
+    param([string] $Text, $ObjectNode, [int] $PropIndex)
+    $properties = $ObjectNode.Properties
+    $property = $properties[$PropIndex]
+    if ($properties.Count -eq 1) {
+        return $Text.Substring(0, $ObjectNode.Start + 1) + $Text.Substring($ObjectNode.End - 1)
     }
-    $perm = $permProp.Value
-    if ($perm -isnot [System.Management.Automation.PSCustomObject]) {
-        return $false
+    if ($PropIndex -gt 0) {
+        $previous = $properties[$PropIndex - 1]
+        return $Text.Substring(0, $previous.Value.End) + $Text.Substring($property.Value.End)
     }
-    $allowProp = $perm.PSObject.Properties['allow']
-    if ($null -eq $allowProp) {
-        return $false
+    $next = $properties[$PropIndex + 1]
+    return $Text.Substring(0, $property.NameStart) + $Text.Substring($next.NameStart)
+}
+
+function Remove-EmptyPermissions {
+    param([string] $Text)
+    $root = Parse-JsonRoot -Text $Text
+    for ($index = 0; $index -lt $root.Properties.Count; $index++) {
+        $property = $root.Properties[$index]
+        if ($property.Name -ceq "permissions" -and $property.Value.Kind -eq "object" -and $property.Value.Properties.Count -eq 0) {
+            return Remove-ObjectProperty -Text $Text -ObjectNode $root -PropIndex $index
+        }
     }
-    $kept = New-Object System.Collections.Generic.List[object]
-    $removed = $false
-    foreach ($item in @($allowProp.Value)) {
-        if (($item -is [string]) -and ($item -ceq $script:ProbeRule)) {
-            $removed = $true
+    return $Text
+}
+
+function Update-JsonProbeText {
+    param([string] $Text)
+    $root = Parse-JsonRoot -Text $Text
+    $found = Find-PermissionsAllow -Root $root
+    if ($null -eq $found) {
+        return @{ HasProbe = $false; OnlyProbe = $false; Changed = $false; Text = $Text }
+    }
+    $onlyProbe = Test-JsonOnlyProbeNode -Root $root
+    $allowValue = $found.Allow.Value
+    if ($allowValue.Kind -eq "string") {
+        if ($allowValue.Value -cne $script:ProbeRule) {
+            return @{ HasProbe = $false; OnlyProbe = $false; Changed = $false; Text = $Text }
+        }
+        $updated = Remove-ObjectProperty -Text $Text -ObjectNode $found.Permissions.Value -PropIndex $found.AllowIndex
+        $updated = Remove-EmptyPermissions -Text $updated
+        return @{ HasProbe = $true; OnlyProbe = $onlyProbe; Changed = $true; Text = $updated }
+    }
+    if ($allowValue.Kind -ne "array") {
+        return @{ HasProbe = $false; OnlyProbe = $false; Changed = $false; Text = $Text }
+    }
+    $elements = $allowValue.Elements
+    $kept = New-Object System.Collections.Generic.List[int]
+    $hasProbe = $false
+    for ($index = 0; $index -lt $elements.Count; $index++) {
+        $element = $elements[$index]
+        if ($element.Kind -eq "string" -and $element.Value -ceq $script:ProbeRule) {
+            $hasProbe = $true
         } else {
-            $kept.Add($item)
+            $kept.Add($index)
         }
     }
-    if (-not $removed) {
-        return $false
+    if (-not $hasProbe) {
+        return @{ HasProbe = $false; OnlyProbe = $false; Changed = $false; Text = $Text }
     }
     if ($kept.Count -eq 0) {
-        $perm.PSObject.Properties.Remove('allow')
-    } else {
-        $allowProp.Value = $kept
+        $updated = Remove-ObjectProperty -Text $Text -ObjectNode $found.Permissions.Value -PropIndex $found.AllowIndex
+        $updated = Remove-EmptyPermissions -Text $updated
+        return @{ HasProbe = $true; OnlyProbe = $onlyProbe; Changed = $true; Text = $updated }
     }
-    if (@($perm.PSObject.Properties).Count -eq 0) {
-        $Parsed.PSObject.Properties.Remove('permissions')
+    $builder = New-Object System.Text.StringBuilder
+    $firstKept = $elements[$kept[0]]
+    [void]$builder.Append($Text.Substring($firstKept.Start, $firstKept.End - $firstKept.Start))
+    for ($keptIndex = 1; $keptIndex -lt $kept.Count; $keptIndex++) {
+        $currentIndex = $kept[$keptIndex]
+        $current = $elements[$currentIndex]
+        $before = $elements[$currentIndex - 1]
+        [void]$builder.Append($Text.Substring($before.End, $current.Start - $before.End))
+        [void]$builder.Append($Text.Substring($current.Start, $current.End - $current.Start))
     }
-    return $true
+    $spanStart = $elements[0].Start
+    $spanEnd = $elements[$elements.Count - 1].End
+    $updated = $Text.Substring(0, $spanStart) + $builder.ToString() + $Text.Substring($spanEnd)
+    return @{ HasProbe = $true; OnlyProbe = $false; Changed = $true; Text = $updated }
+}
+
+function Add-JsonProperty {
+    param([string] $Text, $ObjectNode, [string] $PropertyJson)
+    $innerStart = $ObjectNode.Start + 1
+    $innerEnd = $ObjectNode.End - 1
+    $inner = ""
+    if ($innerEnd -gt $innerStart) {
+        $inner = $Text.Substring($innerStart, $innerEnd - $innerStart)
+    }
+    if ([string]::IsNullOrWhiteSpace($inner)) {
+        return $Text.Substring(0, $innerStart) + $PropertyJson + $Text.Substring($innerEnd)
+    }
+    return $Text.Substring(0, $innerEnd) + "," + $PropertyJson + $Text.Substring($innerEnd)
+}
+
+function Add-ClaudeProbe {
+    param([string] $Text)
+    $root = Parse-JsonRoot -Text $Text
+    if ($null -ne (Find-PermissionsAllow -Root $root)) {
+        throw "allow is already in the .claude file; stop"
+    }
+    $permissions = $null
+    for ($index = 0; $index -lt $root.Properties.Count; $index++) {
+        if ($root.Properties[$index].Name -ceq "permissions") {
+            $permissions = $root.Properties[$index]
+            break
+        }
+    }
+    $ruleJson = '"allow":["' + $script:ProbeRule + '"]'
+    if ($null -ne $permissions) {
+        if ($permissions.Value.Kind -ne "object") {
+            throw "permissions in the .claude file is not an object; stop"
+        }
+        return Add-JsonProperty -Text $Text -ObjectNode $permissions.Value -PropertyJson $ruleJson
+    }
+    return Add-JsonProperty -Text $Text -ObjectNode $root -PropertyJson ('"permissions":{"allow":["' + $script:ProbeRule + '"]}')
+}
+
+function Assert-JsonDocument {
+    param([string] $Text, [string] $Path)
+    $jsonDocumentType = "System.Text.Json.JsonDocument" -as [type]
+    if ($null -eq $jsonDocumentType) {
+        return
+    }
+    $document = $null
+    try {
+        $document = $jsonDocumentType::Parse($Text)
+        if ($document.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            throw "root is not an object"
+        }
+    } catch {
+        throw "could not parse $Path as JSON: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $document) { $document.Dispose() }
+    }
 }
 
 function Remove-MarkerBlock {
@@ -410,13 +587,6 @@ function Invoke-ProbePlant {
         if ($Which -eq "grok" -and [regex]::IsMatch($text, '(?m)^\s*allow\s*=')) {
             throw "allow is already in the .grok file; stop"
         }
-        if ($Which -eq "claude") {
-            $existingJson = Read-JsonObject -Text $text -Path $path
-            $permProp = $existingJson.PSObject.Properties['permissions']
-            if ($permProp -and $permProp.Value -and $permProp.Value.PSObject.Properties['allow']) {
-                throw "allow is already in the .claude file; stop"
-            }
-        }
     }
     $newline = "`n"
     if (-not $blank) {
@@ -453,20 +623,17 @@ function Invoke-ProbePlant {
         if ($blank) {
             $updated = '{"permissions":{"allow":["Bash(echo TASKBENCH-PROBE*)"]}}' + $newline
         } else {
-            $parsed = Read-JsonObject -Text $text -Path $path
-            $permProp = $parsed.PSObject.Properties['permissions']
-            $allowList = New-Object System.Collections.Generic.List[string]
-            $allowList.Add($script:ProbeRule)
-            if ($null -eq $permProp) {
-                $perm = New-Object System.Management.Automation.PSObject
-                $perm | Add-Member -NotePropertyName "allow" -NotePropertyValue $allowList
-                $parsed | Add-Member -NotePropertyName "permissions" -NotePropertyValue $perm
-            } else {
-                $permProp.Value | Add-Member -NotePropertyName "allow" -NotePropertyValue $allowList
+            try {
+                $updated = Add-ClaudeProbe -Text $text
+            } catch {
+                $message = $_.Exception.Message
+                if ($message -like "allow is already*" -or $message -like "permissions in the*") {
+                    throw
+                }
+                throw "could not parse $path as JSON"
             }
-            $updated = (Write-JsonValue -Wrapped (, $parsed)) + $newline
-            $null = Read-JsonObject -Text $updated -Path $path
         }
+        Assert-JsonDocument -Text $updated -Path $path
     }
     if (-not (Test-Path -LiteralPath $directory)) {
         if ($DryRun) {
@@ -518,23 +685,19 @@ function Invoke-CleanFile {
     $created = Get-CreatedMarkerPath -Path $Path
     $hasCreated = Test-Path -LiteralPath $created
     $present = $false
-    $parsed = $null
+    $jsonEdit = $null
     $jsonUnparsed = $false
     if ($exists -and -not [string]::IsNullOrWhiteSpace($text)) {
         if ($isToml) {
             $present = Test-TomlHasProbe -Text $text
         } else {
             try {
-                $parsed = $text | ConvertFrom-Json
+                $jsonEdit = Update-JsonProbeText -Text $text
+                $present = [bool]$jsonEdit.HasProbe
             } catch {
-                $parsed = $null
+                $jsonEdit = $null
                 $jsonUnparsed = $true
-            }
-            if ($parsed -is [System.Management.Automation.PSCustomObject]) {
-                $present = Test-JsonHasProbeRule -Parsed $parsed
-            } elseif ($text.Contains($script:ProbeRule)) {
-                $jsonUnparsed = $true
-                $present = $true
+                if ($text.Contains($script:ProbeRule)) { $present = $true }
             }
         }
     }
@@ -562,6 +725,15 @@ function Invoke-CleanFile {
         return
     }
     if (-not $exists) {
+        if ($hasCreated) {
+            if ($DryRun) {
+                Write-Output "dry-run cleanup: would delete $created because $Path is already gone"
+            } else {
+                [System.IO.File]::Delete($created)
+                Write-Output "cleanup: no file $Path; deleted the created-file marker"
+            }
+            return
+        }
         Write-Output "cleanup: no file $Path"
         return
     }
@@ -576,6 +748,11 @@ function Invoke-CleanFile {
         }
         $stripped = Remove-MarkerBlock -Text $text
         if ($stripped -eq $text) {
+            if ($hasCreated) {
+                if (-not $DryRun) { [System.IO.File]::Delete($created) }
+                Write-Output "cleanup: no probe marker in $Path; deleted the created-file marker because the file has other content"
+                return
+            }
             Write-Output "cleanup: no probe marker in $Path; left the file unchanged"
             return
         }
@@ -584,23 +761,37 @@ function Invoke-CleanFile {
             return
         }
         Write-Utf8NoBom -Path $Path -Text $stripped
+        if ($hasCreated) {
+            [System.IO.File]::Delete($created)
+            Write-Output "cleanup: removed planted lines from $Path and deleted the created-file marker because the file has other content"
+            return
+        }
         Write-Output "cleanup: removed planted lines from $Path"
         return
     }
-    if ($null -eq $parsed -or $parsed -isnot [System.Management.Automation.PSCustomObject]) {
+    if ($jsonUnparsed -or $null -eq $jsonEdit) {
         if ($text.Contains($script:ProbeRule) -or $text.Contains($script:BeginMark)) {
             Write-Output "cleanup: could not parse $Path; left the file untouched"
+            return
+        }
+        if ($hasCreated) {
+            if (-not $DryRun) { [System.IO.File]::Delete($created) }
+            Write-Output "cleanup: no probe marker in $Path; deleted the created-file marker because the file has other content"
             return
         }
         Write-Output "cleanup: no probe marker in $Path; left the file unchanged"
         return
     }
-    if ($hasCreated -and (Test-JsonOnlyProbe -Parsed $parsed)) {
+    if ($jsonEdit.OnlyProbe -and $hasCreated) {
         Remove-CreatedProbeFile -Path $Path -Reason "it contained only the probe rule"
         return
     }
-    $removed = Remove-JsonProbeRule -Parsed $parsed
-    if (-not $removed) {
+    if (-not $jsonEdit.HasProbe) {
+        if ($hasCreated) {
+            if (-not $DryRun) { [System.IO.File]::Delete($created) }
+            Write-Output "cleanup: no probe marker in $Path; deleted the created-file marker because the file has other content"
+            return
+        }
         Write-Output "cleanup: no probe marker in $Path; left the file unchanged"
         return
     }
@@ -608,8 +799,13 @@ function Invoke-CleanFile {
         Write-Output "dry-run cleanup: would remove the probe rule from $Path"
         return
     }
-    $rewritten = (Write-JsonValue -Wrapped (, $parsed)) + (Get-Newline -Text $text)
-    Write-Utf8NoBom -Path $Path -Text $rewritten
+    Assert-JsonDocument -Text $jsonEdit.Text -Path $Path
+    Write-Utf8NoBom -Path $Path -Text $jsonEdit.Text
+    if ($hasCreated) {
+        [System.IO.File]::Delete($created)
+        Write-Output "cleanup: removed the probe rule from $Path and deleted the created-file marker because the file has other content"
+        return
+    }
     Write-Output "cleanup: removed the probe rule from $Path"
 }
 

@@ -1,5 +1,8 @@
 # taskbench install helper.
 #
+# PowerShell 7 is the recommended host. This script still runs on Windows
+# PowerShell 5.1. It reads config JSON and does not rewrite it.
+#
 # Default: print how to run taskbench and change nothing.
 # -WithTailscale is OPTIONAL. It needs the machine owner's approval.
 # It installs Tailscale if needed, runs `tailscale serve` for the port in

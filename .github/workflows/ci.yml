@@ -21,6 +21,19 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 
+  probe-pwsh:
+    name: probe (windows-latest, pwsh)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Probe script under PowerShell 7
+        env:
+          TASKBENCH_PROBE_POWERSHELL: pwsh
+        run: python -m unittest tests.test_final_check.LaptopProbeScriptTests -v
+
   gitleaks:
     name: gitleaks
     runs-on: ubuntu-latest

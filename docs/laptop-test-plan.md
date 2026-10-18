@@ -1,7 +1,8 @@
 # Laptop test: does the pinned home hide the real profile?
 
-Run this in Windows PowerShell 5.1 on the owner's machine, from the taskbench
-checkout. Each block below stands on its own. It recomputes paths from
+Run this in PowerShell 7 on the owner's machine, from the taskbench
+checkout. PowerShell 7 is supported and recommended. Each block below stands
+on its own. It recomputes paths from
 `$env:USERPROFILE` or calls `scripts/laptop-probe.ps1`, which does that
 itself. A new window can run cleanup without the variables from an earlier
 window. Do not paste a real API key into this file or into a command.
@@ -203,13 +204,16 @@ file, then renames the backup to `*.used` so a later cleanup cannot copy it
 again. If the marker and the rule are absent, cleanup leaves the live file
 and the backup alone. Then plant only the `.claude` rule. JSON has no
 comments. The planted rule is the exact string `Bash(echo TASKBENCH-PROBE*)`
-inside `permissions.allow`. Cleanup parses with `ConvertFrom-Json` and
-removes that string. It drops an allow array or a permissions object that
-is empty because this script added it. When `settings.json` did not exist
-before planting, the script writes `settings.json.taskbench-created`.
-Cleanup deletes `settings.json` only when that sidecar exists and the file
-contains nothing but the probe rule. A file that already existed is not
-deleted.
+inside `permissions.allow`. Cleanup splices that exact string out of the
+file and leaves every other byte in place, including dates, numbers, and
+nested objects. On PowerShell 7 it checks the result with `System.Text.Json`.
+It drops an allow array or a permissions object that is empty because this
+script added it. When `settings.json` did not exist before planting, the script writes
+`settings.json.taskbench-created`. Cleanup deletes `settings.json` only when
+that sidecar exists and the file contains nothing but the probe rule. If
+the sidecar is still there and the file has other content, cleanup removes
+only the probe rule, deletes the sidecar, and keeps the file. A file that
+already existed is not deleted.
 
 ```powershell
 .\scripts\laptop-probe.ps1 -Cleanup
@@ -326,7 +330,8 @@ laptop test for an `.exe` install. If it prints that the source is a
 `runners.grok-build.executable` to `$source`. Leave `args_template` on
 `--prompt-file` and `{prompt_file}`, not the hang scenario. Do not put
 `--cwd`, `-c`, or `--config` in `args_template`: taskbench sets the working
-directory itself and rejects those flags. The control command above still
+directory itself. Do not put `--agent` in `args_template`: taskbench does not
+pass `--agent`. The control command above still
 passes `--cwd` because that command is Grok directly, outside taskbench.
 Restart taskbench from this window:
 

@@ -955,9 +955,27 @@ def _exec_canon(key: str) -> str | None:
         return "plugins"
     if norm in {"enabled_plugins", "enabled_plugin"}:
         return "enabled_plugins"
+    if norm in {"extra_known_marketplaces", "extra_known_marketplace"}:
+        return "extra_known_marketplaces"
     if norm == "hooks":
         return "hooks"
     return None
+
+
+def _extra_marketplaces(value: object) -> bool:
+    """Claude ``extraKnownMarketplaces`` counts when it names a marketplace.
+
+    ``false`` and ``{}`` do not. A non-empty object or list does.
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return False
 
 
 def _enabled_plugins_value(value: object) -> bool:
@@ -992,6 +1010,8 @@ def _defines_exec(value: object, *, key: str | None = None) -> bool:
     """
     if key is not None and _exec_canon(key) == "enabled_plugins":
         return _enabled_plugins_value(value)
+    if key is not None and _exec_canon(key) == "extra_known_marketplaces":
+        return _extra_marketplaces(value)
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, (list, tuple, set)):
@@ -1195,7 +1215,8 @@ def scan_project_permission_rules(project: Path) -> list[tuple[str, tuple[str, .
     is not. ``.grok``, ``.claude``, and ``.cursor`` symlinks and junctions are
     followed to their targets on every OS. Keys and mode values are matched
     case-insensitively. A file that defines MCP servers, plugins, Claude
-    ``enabledPlugins``, or hooks is a finding, the same as an allow rule.
+    ``enabledPlugins``, Claude ``extraKnownMarketplaces``, or hooks is a
+    finding, the same as an allow rule.
     Unreadable or unparsed files are
     findings (Needs you), not skips. Values are not returned.
     """
@@ -1227,6 +1248,6 @@ def needs_you_message(findings: list[tuple[str, tuple[str, ...]]]) -> str:
     return (
         "Needs you: project settings could not be checked or contain "
         "auto-approve or allow rules, or they define MCP servers, plugins, "
-        "enabled plugins, or hooks; "
+        "enabled plugins, extra known marketplaces, or hooks; "
         "remove or repair them before this task can run: " + "; ".join(parts)
     )
