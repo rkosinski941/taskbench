@@ -61,15 +61,22 @@ class GuardTests(TempApp):
 
         seen: list[tuple[list[str], bool]] = []
         real = process_tree.subprocess.Popen
+        real_observe = process_tree.observe_spawn
 
         def wrapped(argv, *args, **kwargs):  # type: ignore[no-untyped-def]
             seen.append((list(argv), runner_guard_active()))
             return real(argv, *args, **kwargs)
 
+        def wrapped_observe(argv: list[str]) -> None:
+            seen.append((list(argv), runner_guard_active()))
+            real_observe(argv)
+
         process_tree.subprocess.Popen = wrapped  # type: ignore[method-assign]
         subprocess.Popen = wrapped  # type: ignore[method-assign]
+        process_tree.observe_spawn = wrapped_observe  # type: ignore[method-assign]
         self.addCleanup(lambda: setattr(process_tree.subprocess, "Popen", real))
         self.addCleanup(lambda: setattr(subprocess, "Popen", real))
+        self.addCleanup(lambda: setattr(process_tree, "observe_spawn", real_observe))
         _config, _app, watcher = self.make(scenario="needs-retro-followup", can_ask=False)
         write_packet(self.store.inbox, base_packet(id="guard-1", permissions="plan", timeout_s=30))
         run_until(watcher, lambda: packet_status(self.store, "guard-1") == "done", timeout=10)

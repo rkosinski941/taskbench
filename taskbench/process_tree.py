@@ -163,6 +163,11 @@ def kill_process_group(pgid: int) -> None:
         return
 
 
+def observe_spawn(argv: list[str]) -> None:
+    """No-op hook tests replace to see every process this module starts."""
+    del argv
+
+
 def _require_runner_guard(argv: list[str]) -> None:
     """Runner processes may start only from ``spawn_runner``."""
     from taskbench.launch import argv_is_runner, runner_guard_active
@@ -188,6 +193,7 @@ class ManagedProcess:
             raise ProcessTreeError(
                 "simulated job or process-group assignment failure"
             )
+        observe_spawn(list(argv))
         self.argv = list(argv)
         self.cwd = cwd
         self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -259,6 +265,8 @@ class ManagedProcess:
         env: dict[str, str] | None = None,
     ) -> int:
         child_env = _companion_env(env)
+        _require_runner_guard(argv)
+        observe_spawn(list(argv))
         if os.name == "nt":
             return _win_spawn_companion(self, argv, cwd, child_env)
         group = self._group_id
