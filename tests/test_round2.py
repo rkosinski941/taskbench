@@ -53,6 +53,8 @@ class PinOrderTests(unittest.TestCase):
                 "dontAsk",
                 "--sandbox",
                 "strict",
+                "--output-format",
+                "streaming-messages-json",
                 "--cwd",
                 "x",
                 "--prompt-file",
@@ -64,8 +66,8 @@ class PinOrderTests(unittest.TestCase):
         )
         self.assertEqual(interpreter[1], "fake_runner.py")
         self.assertEqual(
-            interpreter[2:6],
-            ["--permission-mode", "dontAsk", "--sandbox", "strict"],
+            interpreter[2:8],
+            ["--permission-mode", "dontAsk", "--sandbox", "strict", "--output-format", "streaming-messages-json"],
         )
         for args in (["--"], ["--cwd", "x", "--", "--allow", "Bash"], ["--prompt", "--"]):
             with self.subTest(args=args):
@@ -189,8 +191,11 @@ class ModeDetectionTests(unittest.TestCase):
         )
         self.assertIn("unexpected permission mode", reason or "")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("best-effort", readme)
-        self.assertIn("does not emit", readme)
+        self.assertIn("streaming-messages-json", readme)
+        self.assertIn("docs/grok-cli-modes.md", readme)
+        modes = (ROOT / "docs" / "grok-cli-modes.md").read_text(encoding="utf-8")
+        self.assertIn("dontAsk", modes)
+        self.assertIn("permissionMode", modes)
 
 
 class BannerTests(unittest.TestCase):

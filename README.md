@@ -2,7 +2,8 @@
 
 taskbench is a local task runner for one machine. It watches an inbox of
 `joy-feeder.task/v2` YAML packets, runs one of them at a time, and serves a
-web page on `127.0.0.1` only. Python 3.10+ and the standard library are enough.
+web page on `127.0.0.1` only. Python 3.11+ and the standard library are enough
+(`tomllib` reads Grok's TOML settings).
 There is no third-party package.
 
 This replaces the Enjoy desktop pairing flow. The page and the watcher are the
@@ -72,33 +73,45 @@ can still answer; the dead process group is killed first.
   `ask` and `allow-list` packets are blocked before the process starts.
   `--always-approve`, `--yolo`, `--allow`, `--auto-approve`, and any other
   permission flag are rejected.
-- Mode detection is best-effort. The real Grok CLI does not emit
-  `TASKBENCH` permission lines. The review named an init `permissionMode`
-  and did not include a captured line, so taskbench does not guess from
-  ordinary stdout. A run that never reports a mode is not proof of
-  `dontAsk`. If a structured event does report another mode or sandbox,
-  taskbench kills the process and marks the packet `failed`. On Linux,
-  `/proc` is checked only to confirm the argv taskbench launched. That
-  check does not exist on Windows.
-- Before each run, taskbench scans the project for `.grok/config.toml`,
-  `.claude/settings.json`, and `.claude/settings.local.json`, including
-  nested directories. A non-empty `allow`, a true `yolo` / `always-approve`
-  / `auto-approve` / `bypassPermissions`, or a `permission_mode` /
-  `defaultMode` other than `dontAsk` blocks the task. The status stays
+- The launch also pins `--output-format streaming-messages-json`. Grok's
+  public docs put `permissionMode` on the `system`/`init` line of that
+  format. taskbench reads that field. If the init event is missing, or
+  `permissionMode` is missing or is not `dontAsk`, taskbench kills the
+  process tree and marks the packet `failed`. `dontAsk` stays because the
+  permissions guide lists it as the strict CI mode. Sources and the
+  remaining uncertainty are in `docs/grok-cli-modes.md`. Ordinary stdout
+  is not parsed for a mode. On Linux, `/proc` is checked only to confirm
+  the argv taskbench launched. That check does not exist on Windows.
+- Before each run, on every OS, taskbench scans the workdir and each
+  parent up to the user profile or the drive root, whichever comes first.
+  It reads `.grok/config.toml`, `.claude/settings.json`, and
+  `.claude/settings.local.json`, including nested directories, and follows
+  a symlinked or junctioned `.grok` or `.claude` folder to its target.
+  Keys and values are matched case-insensitively with `tomllib` and
+  `json`. A non-empty `allow`, a true `yolo` / `always-approve` /
+  `auto-approve` / `bypassPermissions`, or a `permission_mode` /
+  `defaultMode` other than `dontAsk` blocks the task. A settings file that
+  cannot be read or parsed blocks the task too. The status stays
   `blocked`. The page shows **Needs you** and names the file and the rule
   keys, not the rule values. Deny-only files still run. On Linux, user-level
   `~/.grok` is not replaced, because `--sandbox strict` is the OS boundary
   there. `--permission-mode dontAsk` overrides a config `permission_mode`
   or `yolo`, but an explicit allow rule in the user config can still
   auto-approve inside that sandbox. `/etc/grok` cannot be redirected.
+  Packet files stay on the YAML subset in `taskbench/yaml_subset.py`
+  because the task spec is YAML and the standard library has no YAML
+  parser. That limit is written down in `docs/parsers.md`.
 - Windows has no OS sandbox. Grok's `--sandbox strict` is Landlock and
   Seatbelt only, and the CLI continues when it cannot apply a sandbox.
   taskbench still runs on Windows. It shows `No OS sandbox on Windows; only taskbench approvals protect you`
   on the page and as the first line of each run's output file. For each
   Grok launch it recreates an empty `var/grok-home` and sets `HOME`,
   `USERPROFILE`, and `GROK_HOME` to that directory (and `HOMEDRIVE` /
-  `HOMEPATH` when the path has a drive). The review names `HOME` and
-  `USERPROFILE` as the variables that select `~/.grok` and `~/.claude`.
+  `HOMEPATH` when the path has a drive). When `XAI_API_KEY` is set it is
+  passed through the environment allow-list and no credential file is
+  copied. Otherwise only `auth.json` is copied into that home, never
+  settings. Details, doc URLs, and the laptop check are in
+  `docs/grok-cli-home-and-auth.md` and `docs/laptop-test-plan.md`.
 - The runner and any sidecar share an environment allow-list (`PATH`,
   locale, and a few Windows system variables). `GROK_*`, `PYTHONPATH`,
   `XDG_CONFIG_HOME`, and similar parent overrides are not passed through.
@@ -134,12 +147,14 @@ packets that request them are `blocked` and the process is not started.
 
 Set `executable` and `args_template` yourself. Placeholders are
 `{prompt_file}`, `{project_dir}`, and `{timeout_s}`. taskbench puts
-`--permission-mode dontAsk` and `--sandbox strict` first, after the
-executable, and refuses other permission flags and `--`. The child gets
+`--permission-mode dontAsk`, `--sandbox strict`, and
+`--output-format streaming-messages-json` first, after the executable,
+and refuses other permission flags and `--`. The child gets
 `TASKBENCH_APPROVALS=1` and no Grok variables from the parent. On Windows
-those config-dir variables are then set to the empty grok home. The real
-CLI does not speak the permission lines in the protocol below; that check
-is best-effort only.
+those config-dir variables are then set to the empty grok home. How that
+home is chosen, and how auth is seeded, is `docs/grok-cli-home-and-auth.md`.
+The real CLI's permission check is the init event described above. The
+`TASKBENCH` lines below are the action protocol the test stub speaks.
 
 Assumed stdout protocol, one JSON object per line, prefixed with `TASKBENCH `:
 
@@ -259,19 +274,36 @@ available. That control is not shown for a tailnet Host, and the picker
 route refuses any host that is not `127.0.0.1` or `localhost`.
 
 Symlinks and Windows junctions are resolved with `os.path.realpath` before
-the path is accepted. Missing paths, files, drive roots, the user profile
-root itself, and system folders are rejected. System folders include
-`Windows`, `System32`, `Program Files`, `Program Files (x86)`, and
-`ProgramData` on Windows, and `/`, `/etc`, `/usr`, `/bin`, and `/System`
-on POSIX.
+the path is accepted. On Windows the resolved path is then passed through
+`GetFinalPathNameByHandleW` and `GetLongPathNameW`, so `\\?\`, UNC, and
+8.3 short names become the real long path. Comparison is case-insensitive
+on Windows and macOS. The path is resolved again immediately before launch
+and refused if it changed.
 
-A task with `from: web-ui` may use a new valid folder. taskbench stores
-the resolved path in its data directory (`workdir-registry.json`), not in
-the repo. Any other sender may use only a folder already in that registry.
-An unregistered bot path is `needs-approval`, shown as **Needs you**, with
-the resolved path on the task. It is not added to the registry until the
-owner approves that folder. A rejected path is `blocked` with reason
-`invalid workdir`.
+Missing paths, files, and drive roots are rejected. So are the user profile
+itself, `Documents`, `Desktop`, `Downloads`, and `OneDrive` (including
+`OneDrive - *`) themselves. A subfolder of those personal folders is
+allowed. Anything inside `AppData`, anything inside a dot-folder under the
+profile (`.ssh`, `.grok`, `.claude`, and any other `.*`), and the taskbench
+install, config, and state folders are rejected. A folder that contains
+one of those (an ancestor of a denied path) is rejected. A hidden directory
+inside the chosen folder is also rejected, except `.grok` and `.claude`
+(the allow-rule scan reports those), `.git`, `.github`, and `.taskbench`
+(the watcher creates `.taskbench` for `LAST_AGENT.md`).
+
+System folders include `Windows`, `System32`, `Program Files`,
+`Program Files (x86)`, and `ProgramData` on Windows, and `/`, `/etc`,
+`/usr`, `/bin`, and `/System` on POSIX.
+
+A packet never registers a folder, whatever `from` says. The owner
+registers one by posting to the local page. That request must carry the
+per-launch token kept in server memory, and its Origin and Host must be
+`127.0.0.1`, `localhost`, or a name in `allowed_hosts`. The registry lives
+in taskbench's data directory (`workdir-registry.json`), not in the repo.
+An unregistered folder is `needs-approval`, shown as **Needs you**, with
+the resolved path on the task. A rejected path is `blocked` with reason
+`invalid workdir`. The path is resolved again immediately before launch
+and refused if it changed.
 
 See `docs/SPEC-ADDITIONS.md`.
 

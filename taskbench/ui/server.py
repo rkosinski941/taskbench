@@ -53,6 +53,38 @@ def ensure_loopback(host: str) -> None:
         raise BindError(f"refusing to bind {host!r}; taskbench listens on 127.0.0.1 only")
 
 
+def _same_secret(supplied: str | None, expected: str | None) -> bool:
+    """Constant-time match. A different length is a failure, not a 500."""
+    if not supplied or not expected:
+        return False
+    try:
+        return secrets.compare_digest(supplied, expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def origin_allowed(origin: str | None, port: int, allowed_hosts: list[str]) -> bool:
+    """POST Origin must be loopback or a configured allowed host."""
+    if not origin:
+        return False
+    text = origin.strip().rstrip("/")
+    allowed = {
+        f"http://127.0.0.1:{port}",
+        "http://127.0.0.1",
+        f"http://localhost:{port}",
+        "http://localhost",
+    }
+    for extra in allowed_hosts:
+        name = extra.strip()
+        if not name or "/" in name or " " in name:
+            continue
+        for scheme in ("http", "https"):
+            allowed.add(f"{scheme}://{name}")
+            allowed.add(f"{scheme}://{name}:{port}")
+    folded = {item.rstrip("/").casefold() for item in allowed}
+    return text.casefold() in folded
+
+
 def host_allowed(host_header: str | None, port: int, allowed_hosts: list[str]) -> bool:
     if not host_header:
         return False
@@ -95,6 +127,8 @@ class App:
         self.config = config
         self.store = StateStore(config.data_dir)
         self.watcher = Watcher(config, self.store)
+        # Per-launch secret. Memory only. Not written to disk or the repo.
+        self.launch_token = secrets.token_urlsafe(32)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -148,13 +182,21 @@ class Handler(BaseHTTPRequestHandler):
         token, _fresh = self._session_token()
         cookie = _cookie(self.headers.get("Cookie"), COOKIE)
         supplied = form.get("csrf", "")
-        if not cookie or not secrets.compare_digest(cookie, supplied):
+        if not _same_secret(cookie, supplied):
             self._send(403, "text/plain; charset=utf-8", b"CSRF check failed", None)
+            return
+        launch = form.get("launch", "")
+        expected = self.server.app.launch_token
+        if not _same_secret(launch, expected):
+            self._send(403, "text/plain; charset=utf-8", b"launch token check failed", None)
             return
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/tasks":
             self._create_task(form)
+            return
+        if path == "/register-workdir":
+            self._register_workdir(form)
             return
         if path == "/pick-folder":
             self._pick_folder()
@@ -196,13 +238,14 @@ class Handler(BaseHTTPRequestHandler):
         resolved_workdir = ""
         if workdir_raw:
             try:
-                chosen = validate_workdir(workdir_raw)
+                chosen = self._checked_folder(workdir_raw)
             except WorkdirError as exc:
                 message = f"invalid workdir: {exc}"
                 body = f"<p>{html.escape(message)}</p><p><a href='/'>Back</a></p>".encode("utf-8")
                 self._send(400, "text/html; charset=utf-8", body, None)
                 return
-            register_workdir(self.server.app.config.data_dir, chosen)
+            if not is_registered(self.server.app.config.data_dir, chosen):
+                register_workdir(self.server.app.config.data_dir, chosen)
             resolved_workdir = str(chosen)
         packet: dict[str, Any] = {
             "schema": "joy-feeder.task/v2",
@@ -226,6 +269,24 @@ class Handler(BaseHTTPRequestHandler):
         path = self.server.app.store.inbox / f"{packet['id']}.yaml"
         atomic_write_text(path, emit_yaml(packet))
         self._redirect()
+
+    def _register_workdir(self, form: dict[str, str]) -> None:
+        """The only registration path. Packets never call this."""
+        raw = form.get("path", "").strip() or form.get("workdir", "").strip()
+        try:
+            chosen = self._checked_folder(raw)
+        except WorkdirError as exc:
+            message = f"invalid workdir: {exc}"
+            body = f"<p>{html.escape(message)}</p><p><a href='/'>Back</a></p>".encode("utf-8")
+            self._send(400, "text/html; charset=utf-8", body, None)
+            return
+        register_workdir(self.server.app.config.data_dir, chosen)
+        self._redirect()
+
+    def _checked_folder(self, raw: str) -> Path:
+        config_path = getattr(self.server.app.config, "config_path", None)
+        parent = Path(config_path).resolve().parent if config_path else None
+        return validate_workdir(raw, state_dir=self.server.app.config.data_dir, config_dir=parent)
 
     def _pick_folder(self) -> None:
         if not _loopback_host(self.headers.get("Host")):
@@ -314,19 +375,8 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _check_origin(self) -> bool:
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
         port = int(self.server.server_address[1])
-        allowed = {
-            f"http://127.0.0.1:{port}",
-            f"http://localhost:{port}",
-        }
-        for extra in self.server.app.config.allowed_hosts:
-            name = extra.strip()
-            if name:
-                allowed.add(f"http://{name}:{port}")
-        if origin.rstrip("/") in {item.rstrip("/") for item in allowed} or origin in allowed:
+        if origin_allowed(self.headers.get("Origin"), port, self.server.app.config.allowed_hosts):
             return True
         self._send(403, "text/plain; charset=utf-8", b"rejected origin", None)
         return False
@@ -425,8 +475,8 @@ def _composer(app: App, token: str, *, prefill_workdir: str = "", local_picker: 
     )
     return (
         "<form method='post' action='/tasks'>"
-        f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
-        "<p>New task as <strong data-human-label='web-ui'>web-ui</strong></p>"
+        + _hidden_tokens(app, token)
+        + "<p>New task as <strong data-human-label='web-ui'>web-ui</strong></p>"
         f"<label>Project <select name='project'>{project_options}</select></label> "
         f"<label>Runner <select name='runner'>{runner_options}</select></label> "
         "<label>Permissions <select name='permissions'>"
@@ -440,7 +490,7 @@ def _composer(app: App, token: str, *, prefill_workdir: str = "", local_picker: 
         "<textarea name='allow' rows='3'></textarea></label></p>"
         "<p><label>Task<br><textarea name='goal' rows='8' required></textarea></label></p>"
         "<button type='submit'>Queue task</button></form>"
-        + _picker_form(local_picker, token)
+        + _picker_form(app, local_picker, token)
     )
 
 
@@ -494,8 +544,8 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
             "<form method='post' action='/task/"
             + html.escape(packet_id)
             + "/cancel'>"
-            f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
-            "<button type='submit'>Cancel</button></form>"
+            + _hidden_tokens(app, token)
+            + "<button type='submit'>Cancel</button></form>"
         )
     if status == "needs-approval":
         meta = app.store.read_meta(packet_id)
@@ -507,13 +557,20 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         parts.append(f"<pre class='command'>{html.escape(command)}</pre>")
         if diff:
             parts.append(f"<pre class='diff'>{html.escape(diff)}</pre>")
+        if workdir_trust:
+            parts.append(
+                "<form method='post' action='/register-workdir'>"
+                + _hidden_tokens(app, token)
+                + f"<input type='hidden' name='path' value='{html.escape(str(packet.get('workdir') or ''))}'>"
+                + "<button type='submit'>Register this folder</button></form>"
+            )
         for action, label in (("approve", "Approve"), ("deny", "Deny")):
             parts.append(
                 "<form method='post' action='/task/"
                 + html.escape(packet_id)
                 + f"/{action}'>"
-                f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
-                f"<button type='submit'>{label}</button></form>"
+                + _hidden_tokens(app, token)
+                + f"<button type='submit'>{label}</button></form>"
             )
     parts.append("<ul class='files'>")
     for suffix, label in (
@@ -607,14 +664,21 @@ def _folder_field(app: App, prefill: str) -> str:
     )
 
 
-def _picker_form(local_picker: bool, token: str) -> str:
+def _hidden_tokens(app: App, token: str) -> str:
+    return (
+        f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
+        f"<input type='hidden' name='launch' value='{html.escape(app.launch_token)}'>"
+    )
+
+
+def _picker_form(app: App, local_picker: bool, token: str) -> str:
     if not local_picker:
         return ""
     return (
         "<form method='post' action='/pick-folder'>"
-        f"<input type='hidden' name='csrf' value='{html.escape(token)}'>"
-        "<button type='submit'>Browse folders</button>"
-        "<p class='picker-note'>The folder picker runs only for a loopback page.</p></form>"
+        + _hidden_tokens(app, token)
+        + "<button type='submit'>Browse folders</button>"
+        + "<p class='picker-note'>The folder picker runs only for a loopback page.</p></form>"
     )
 
 

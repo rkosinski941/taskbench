@@ -15,6 +15,8 @@
         "dontAsk",
         "--sandbox",
         "strict",
+        "--output-format",
+        "streaming-messages-json",
         "--prompt-file",
         "{prompt_file}",
         "--cwd",

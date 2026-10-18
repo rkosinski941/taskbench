@@ -83,6 +83,7 @@ class Config:
     max_timeout_s: int = 7200
     poll_interval_s: float = 0.2
     runners: dict[str, RunnerConfig] = field(default_factory=dict)
+    config_path: Path | None = None
 
 
 def load_config(path: Path) -> Config:
@@ -109,7 +110,7 @@ def load_config(path: Path) -> Config:
     data_dir = _resolve_dir(base, raw.get("data_dir", "var"), "data_dir")
     projects_dir = _resolve_dir(base, raw.get("projects_dir", "projects"), "projects_dir")
     runners = _load_runners(raw.get("runners", {}))
-    return Config(
+    loaded = Config(
         bind_host=bind_host,
         port=port,
         allowed_hosts=list(allowed),
@@ -117,8 +118,10 @@ def load_config(path: Path) -> Config:
         watcher_name=watcher.strip(),
         data_dir=data_dir,
         projects_dir=projects_dir,
+        config_path=path.resolve(),
         runners=runners,
     )
+    return loaded
 
 
 def _resolve_dir(base: Path, value: object, label: str) -> Path:

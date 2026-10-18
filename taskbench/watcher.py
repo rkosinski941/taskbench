@@ -27,6 +27,7 @@ from taskbench.permissions import (
     prepare_grok_config_home,
     scan_project_permission_rules,
     scrub_environment,
+    seed_grok_credentials,
     unexpected_permission,
     windows_sandbox_banner,
 )
@@ -52,7 +53,7 @@ from taskbench.workdir import (
     WorkdirError,
     WorkdirTrustError,
     is_registered,
-    register_workdir,
+    same_canonical,
     validate_workdir,
 )
 from taskbench.safety import (
@@ -268,6 +269,7 @@ class Watcher:
         self.store.write_prompt(packet_id, prompt)
         timeout_s = int(packet.get("timeout_s") or 900)
         try:
+            folder = self._confirm_launch_folder(folder)
             argv = adapter.build_command(
                 prompt_file=self.store.outbox / f"{packet_id}.prompt.md",
                 project_dir=folder,
@@ -276,6 +278,7 @@ class Watcher:
             config_home = None
             if os.name == "nt" and adapter.name == "grok-build":
                 config_home = prepare_grok_config_home(self.config.data_dir)
+                seed_grok_credentials(config_home, os.environ.copy())
             env = adapter.environment(os.environ.copy(), config_home=config_home)
         except (NotImplementedError, ValueError) as exc:
             self._publish_blocked(packet, str(exc))
@@ -413,6 +416,37 @@ class Watcher:
         return None
 
     def _handle_event(self, packet: dict[str, Any], event: dict[str, Any]) -> str:
+        if not self.run_state.get("init_ok"):
+            if not event.get("init"):
+                self._kill_and_finish(
+                    packet,
+                    "failed",
+                    "missing permissionMode init event",
+                    killed=True,
+                )
+                return "terminal"
+            mode = event.get("permissionMode", event.get("permission_mode", event.get("mode")))
+            if mode is None or not str(mode).strip():
+                self._kill_and_finish(
+                    packet,
+                    "failed",
+                    "missing permissionMode on the streaming-messages init event",
+                    killed=True,
+                )
+                return "terminal"
+            folded = str(mode).strip().lower().replace("-", "").replace("_", "")
+            if folded != "dontask":
+                self._kill_and_finish(
+                    packet,
+                    "failed",
+                    "unexpected permission mode: "
+                    f"{mode} (expected dontAsk from the streaming-messages init event); "
+                    "refusing to continue",
+                    killed=True,
+                )
+                return "terminal"
+            self.run_state["init_ok"] = True
+            return "continue"
         reason = unexpected_permission(event)
         if reason:
             self._kill_and_finish(packet, "failed", reason, killed=True)
@@ -642,6 +676,14 @@ class Watcher:
     def _finish_exit(self, packet: dict[str, Any], code: int) -> str:
         summary = self.run_state.get("summary")
         texts = [item for item in self.run_state.get("texts") or [] if item]
+        if not self.run_state.get("init_ok"):
+            tail = _last_lines(self.store.read_output(str(packet["id"])), 20)
+            reason = "missing permissionMode init event"
+            if code != 0:
+                reason = f"{reason}; exit {code}"
+            if tail:
+                reason = f"{reason}: {tail}"
+            return self._kill_and_finish(packet, "failed", reason, killed=False)
         if code != 0:
             tail = _last_lines(self.store.read_output(str(packet["id"])), 20)
             reason = f"exit {code}"
@@ -874,24 +916,22 @@ class Watcher:
     def _resolve_run_folder(self, packet: dict[str, Any]) -> Path:
         """Project root for this packet.
 
-        A ``workdir`` is resolved before it is accepted. Bots cannot add a
-        folder to the registry. ``web-ui`` can. An unregistered bot path is
-        ``needs-approval`` (the page shows Needs you) and is not stored until
-        the owner approves it. A rejected path is ``invalid workdir``.
+        A ``workdir`` is resolved before it is accepted. ``from`` is never
+        used to decide trust. An unregistered folder, including one on a
+        ``web-ui`` packet, is ``needs-approval`` (the page shows Needs you).
+        Only the local UI register endpoint adds a folder. A rejected path
+        is ``invalid workdir``.
         """
         raw = packet.get("workdir")
         if isinstance(raw, str) and raw.strip():
             try:
-                folder = validate_workdir(raw)
+                folder = self._validate_folder(raw)
             except WorkdirError as exc:
                 if exc.resolved:
                     packet["workdir"] = exc.resolved
                 raise WorkdirError("invalid workdir", exc.resolved) from exc
             packet["workdir"] = str(folder)
-            sender = str(packet.get("from") or "")
-            if sender == "web-ui":
-                register_workdir(self.config.data_dir, folder)
-            elif not is_registered(self.config.data_dir, folder):
+            if not is_registered(self.config.data_dir, folder):
                 raise WorkdirTrustError(
                     "Needs you: workdir is not registered: " + str(folder),
                     str(folder),
@@ -933,41 +973,50 @@ class Watcher:
     def _service_workdir_approval(self, packet: dict[str, Any]) -> str:
         packet_id = str(packet["id"])
         decision = self.store.read_meta(packet_id).get("decision")
-        if decision is None:
-            return "needs-approval"
         folder_text = str(
             self.store.read_meta(packet_id).get("pending_workdir") or packet.get("workdir") or ""
         )
-        if decision != "approved":
+        if decision == "denied":
             self._mark_decision(packet, "denied")
             self._finish_without_process(packet, "blocked", "refused workdir", killed=True)
             return "blocked"
         try:
-            folder = validate_workdir(folder_text)
+            folder = self._validate_folder(folder_text)
         except WorkdirError:
             self._finish_without_process(packet, "blocked", "invalid workdir", killed=True)
             return "blocked"
-        register_workdir(self.config.data_dir, folder)
+        if not is_registered(self.config.data_dir, folder):
+            return "needs-approval"
         packet["workdir"] = str(folder)
-        self._mark_decision(packet, "approved")
         packet["status"] = "claimed"
         self.store.move_packet(
             "needs-approval",
             "claimed",
             packet,
-            f"{packet_id} workdir approved",
+            f"{packet_id} workdir registered",
         )
         return self._start(packet)
+
+    def _validate_folder(self, raw: str) -> Path:
+        config_dir = getattr(self.config, "config_path", None)
+        parent = Path(config_dir).resolve().parent if config_dir else None
+        return validate_workdir(raw, state_dir=self.config.data_dir, config_dir=parent)
+
+    def _confirm_launch_folder(self, folder: Path) -> Path:
+        """Re-resolve immediately before launch and refuse a swapped path."""
+        confirmed = self._validate_folder(str(folder))
+        if not same_canonical(confirmed, folder):
+            raise WorkdirError("workdir changed before launch", str(confirmed))
+        return confirmed
 
     def _handoff_folder(self, packet: dict[str, Any]) -> Path | None:
         raw = packet.get("workdir")
         if isinstance(raw, str) and raw.strip():
             try:
-                folder = validate_workdir(raw)
+                folder = self._validate_folder(raw)
             except WorkdirError:
                 return None
-            sender = str(packet.get("from") or "")
-            if sender != "web-ui" and not is_registered(self.config.data_dir, folder):
+            if not is_registered(self.config.data_dir, folder):
                 return None
             return folder if folder.is_dir() else None
         project = packet.get("project")

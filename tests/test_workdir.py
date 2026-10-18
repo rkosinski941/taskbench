@@ -152,7 +152,9 @@ class RejectionTests(unittest.TestCase):
         )
 
     def test_symlink_and_junction_resolve_before_accept(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
+        scratch = Path(__file__).resolve().parents[1] / "test-scratch"
+        scratch.mkdir(exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(dir=scratch)
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         real = _safe_dir(root, "real")
@@ -210,9 +212,23 @@ class RegistryAndRunTests(TempApp):
         self.assertEqual(load_registry(self.root / "var"), [])
         self.assertFalse((folder / ".taskbench" / "LAST_AGENT.md").exists())
 
-    def test_web_ui_registers_and_drives_scope(self) -> None:
+    def test_web_ui_packet_does_not_register(self) -> None:
         _config, _app, watcher = self.make(scenario="read-ok", can_ask=False)
         folder = self._workdir()
+        packet = base_packet(id="ui-dir", permissions="plan", timeout_s=30, **{"from": "web-ui"})
+        packet["workdir"] = str(folder)
+        write_packet(self.store.inbox, packet)
+        run_until(watcher, lambda: packet_status(self.store, "ui-dir") == "needs-approval")
+        saved = parse_yaml((self.store.needs_approval / "ui-dir.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(saved["from"], "web-ui")
+        self.assertEqual(saved["workdir"], str(folder.resolve()))
+        self.assertFalse(is_registered(self.root / "var", folder.resolve()))
+        self.assertFalse((folder / ".taskbench" / "LAST_AGENT.md").exists())
+
+    def test_registered_folder_drives_scope(self) -> None:
+        _config, _app, watcher = self.make(scenario="read-ok", can_ask=False)
+        folder = self._workdir()
+        register_workdir(self.root / "var", folder.resolve())
         packet = base_packet(id="ui-dir", permissions="plan", timeout_s=30, **{"from": "web-ui"})
         packet["workdir"] = str(folder)
         write_packet(self.store.inbox, packet)
@@ -254,6 +270,7 @@ class RegistryAndRunTests(TempApp):
     def test_rules_are_scanned_in_the_workdir(self) -> None:
         _config, _app, watcher = self.make(scenario="echo", can_ask=False)
         folder = self._workdir()
+        register_workdir(self.root / "var", folder.resolve())
         grok = folder / ".grok"
         grok.mkdir()
         grok.joinpath("config.toml").write_text('allow = ["SECRET_IN_WORKDIR"]\n', encoding="utf-8")
@@ -295,18 +312,24 @@ class WebUiTests(TempApp):
         self.assertIn("name='workdir'", body)
         self.assertIn("recent-folders", body)
         token = re.search(r"name='csrf' value='([^']+)'", body)
+        launch = re.search(r"name='launch' value='([^']+)'", body)
         self.assertIsNotNone(token)
+        self.assertIsNotNone(launch)
         cookie = page.getheader("Set-Cookie")
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         form = (
-            f"csrf={token.group(1)}&goal=Use+this+folder&project=demo-canvas"
+            f"csrf={token.group(1)}&launch={launch.group(1)}&goal=Use+this+folder&project=demo-canvas"
             f"&runner=grok-build&permissions=plan&workdir={folder}"
         )
         conn.request(
             "POST",
             "/tasks",
             body=form,
-            headers={"Cookie": cookie.split(";", 1)[0], "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Cookie": cookie.split(";", 1)[0],
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://127.0.0.1:{port}",
+            },
         )
         created = conn.getresponse()
         created.read()
@@ -353,14 +376,17 @@ class WebUiTests(TempApp):
         server.pick_local_folder = fail_if_called
         self.addCleanup(lambda: setattr(server, "pick_local_folder", original))
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        launch = re.search(br"name='launch' value='([^']+)'", body)
+        self.assertIsNotNone(launch)
         conn.request(
             "POST",
             "/pick-folder",
-            body=f"csrf={token.group(1).decode()}",
+            body=f"csrf={token.group(1).decode()}&launch={launch.group(1).decode()}",
             headers={
                 "Host": host,
                 "Cookie": cookie.split(";", 1)[0],
                 "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://{host}",
             },
         )
         refused = conn.getresponse()

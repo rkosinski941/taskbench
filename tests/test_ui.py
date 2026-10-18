@@ -74,14 +74,20 @@ class PageTests(TempApp):
         conn.close()
         self.assertEqual(denied.status, 403)
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        launch = re.search(br"name='launch' value='([^']+)'", page.body).group(1).decode("ascii")
         body = (
-            f"csrf={token}&goal=Hello+from+the+page&project=demo-canvas&runner=grok-build&from=Joy+Feeder"
+            f"csrf={token}&launch={launch}&goal=Hello+from+the+page"
+            f"&project=demo-canvas&runner=grok-build&from=Joy+Feeder"
         )
         conn.request(
             "POST",
             "/tasks",
             body=body,
-            headers={"Cookie": cookie.split(";")[0], "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Cookie": cookie.split(";")[0],
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://127.0.0.1:{self.port}",
+            },
         )
         created = conn.getresponse()
         created.read()
@@ -100,15 +106,17 @@ class PageTests(TempApp):
         self.assertIn(b"data-tailscale-user='alice@example.com'", shown.body)  # type: ignore[attr-defined]
         self.assertIn(b"Tailscale user: alice@example.com", shown.body)  # type: ignore[attr-defined]
         token = self._token(shown)
+        launch = re.search(br"name='launch' value='([^']+)'", shown.body).group(1).decode("ascii")
         cookie = shown.getheader("Set-Cookie").split(";")[0]
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request(
             "POST",
             "/tasks",
-            body=f"csrf={token}&goal=Hi&project=demo-canvas&runner=grok-build",
+            body=f"csrf={token}&launch={launch}&goal=Hi&project=demo-canvas&runner=grok-build",
             headers={
                 "Cookie": cookie,
                 "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://127.0.0.1:{self.port}",
                 "Tailscale-User-Login": "Rich",
             },
         )

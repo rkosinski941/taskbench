@@ -12,9 +12,11 @@ passes an empty config home and this adapter sets ``HOME``, ``USERPROFILE``,
 and ``GROK_HOME`` to it. ``can_ask`` defaults to false because ``dontAsk``
 does not ask taskbench.
 
-Permission-mode detection is best-effort. The real Grok CLI does not emit
-the ``TASKBENCH`` permission lines below. A missing line is not proof of
-``dontAsk``.
+The process is started with ``--output-format streaming-messages-json``.
+The watcher requires a ``system``/``init`` event and reads ``permissionMode``
+from it. A missing init, or a mode other than ``dontAsk``, kills the tree
+and marks the run failed. See ``docs/grok-cli-modes.md``. The TASKBENCH
+lines below are the test stub's action protocol, not Grok's native stream.
 
 Assumed stdout protocol, one JSON object per line::
 
@@ -37,9 +39,11 @@ them; do not point this adapter at a mode that self-approves.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
-from taskbench.adapters.base import Adapter
+from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import RunnerConfig
 from taskbench.permissions import apply_config_home, ensure_pinned_args
 
@@ -76,3 +80,27 @@ class GrokBuildAdapter(Adapter):
         if config_home is not None:
             env = apply_config_home(env, config_home)
         return env
+
+    def parse_line(self, line: str) -> dict[str, Any] | None:
+        """Read a streaming-messages init event, or a TASKBENCH action line.
+
+        ``permissionMode`` is documented on the ``system``/``init`` line of
+        ``--output-format streaming-messages-json``. Other native JSON events
+        are ignored here. The test stub still speaks TASKBENCH for actions.
+        """
+        stripped = line.strip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ProtocolError(f"invalid streaming JSON line: {exc}") from exc
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("type") == "system" and payload.get("subtype") == "init":
+                return {
+                    "type": "permission_mode",
+                    "permissionMode": payload.get("permissionMode", payload.get("permission_mode")),
+                    "init": True,
+                }
+            return None
+        return super().parse_line(line)

@@ -13,7 +13,15 @@ from taskbench.config import ConfigError, load_config
 from taskbench.ui.server import App, serve
 
 
+def require_python(version: tuple[int, int] | None = None) -> None:
+    """tomllib, used for Grok's TOML settings, needs Python 3.11 or newer."""
+    current = version if version is not None else sys.version_info[:2]
+    if current < (3, 11):
+        raise SystemExit(f"taskbench requires Python 3.11 or newer (this is {current[0]}.{current[1]})")
+
+
 def main(argv: list[str] | None = None) -> int:
+    require_python()
     parser = argparse.ArgumentParser(prog="taskbench", description="Local task runner")
     parser.add_argument("--config", default="config.json", help="path to config.json")
     parser.add_argument("--version", action="store_true")

@@ -110,7 +110,9 @@ def packet_status(store: StateStore, packet_id: str) -> str | None:
 
 class TempApp(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        scratch = ROOT / "test-scratch"
+        scratch.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=scratch)
         self.root = Path(self._tmp.name)
         self.addCleanup(self._cleanup)
 

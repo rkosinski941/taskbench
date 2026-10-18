@@ -452,14 +452,19 @@ class RemoteEditsNeedDesktopReview(TempApp):
         self.assertIn("hello from taskbench", body)
         self.assertIn("<pre class='diff'>", body)
         token = re.search(r"name='csrf' value='([^']+)'", body).group(1)
+        launch = re.search(r"name='launch' value='([^']+)'", body).group(1)
         notes = self.root / "projects" / "demo-canvas" / "notes.txt"
         self.assertFalse(notes.exists())
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request(
             "POST",
             "/task/edit-1/approve",
-            body=f"csrf={token}&command=ignore-this",
-            headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+            body=f"csrf={token}&launch={launch}&command=ignore-this",
+            headers={
+                "Cookie": cookie,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://127.0.0.1:{port}",
+            },
         )
         approved = conn.getresponse()
         approved.read()
@@ -570,7 +575,24 @@ class BotWorkdirTrust(TempApp):
         again["workdir"] = str(folder)
         write_packet(self.store.inbox, again)
         run_until(watcher, lambda: packet_status(self.store, "bot-dir-2") == "needs-approval")
-        watcher.request_decision("bot-dir-2", "approved")
+        csrf = re.search(r"name='csrf' value='([^']+)'", page).group(1)
+        launch = re.search(r"name='launch' value='([^']+)'", page).group(1)
+        reg = http.client.HTTPConnection("127.0.0.1", int(server.server_address[1]), timeout=5)
+        reg.request(
+            "POST",
+            "/register-workdir",
+            body=f"csrf={csrf}&launch={launch}&path={resolved}",
+            headers={
+                "Cookie": "taskbench_csrf=" + csrf,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": f"http://127.0.0.1:{server.server_address[1]}",
+            },
+        )
+        registered = reg.getresponse()
+        registered.read()
+        reg.close()
+        self.assertEqual(registered.status, 303)
+        self.assertTrue(is_registered(self.root / "var", folder.resolve()))
         run_until(watcher, lambda: packet_status(self.store, "bot-dir-2") == "done")
         self.assertTrue(is_registered(self.root / "var", folder.resolve()))
         handoff = _read(folder / ".taskbench" / "LAST_AGENT.md")

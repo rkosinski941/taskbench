@@ -20,13 +20,13 @@ When `workdir` is present:
   `INSTRUCTIONS.md`, for `<folder>/.taskbench/LAST_AGENT.md`, and for the
   scan of `.grok` and `.claude` permission files.
 - The resolved path is shown on the task and in the approval prompt.
-- `from: web-ui` may introduce a new valid folder. taskbench records it in
-  the local data directory (`workdir-registry.json`). That file is not part
-  of the project repo.
-- Any other `from` may use only a folder already in that registry. An
-  unregistered path goes to `needs-approval`. The page shows **Needs you**
-  and the resolved path. It is not added to the registry until the owner
-  approves that folder.
+- `from` is not used for trust. A packet never registers a folder, including
+  `from: web-ui` and review handoffs. The owner registers a folder only by
+  posting to the local UI endpoint, which checks a per-launch token held in
+  server memory, plus Origin and Host.
+- An unregistered path goes to `needs-approval`. The page shows **Needs you**
+  and the resolved path. It is not added to the registry until that UI
+  endpoint records it.
 - A rejected path (missing, not a directory, drive root, profile root, or
   system folder, including a symlink or junction that lands there) is
   `blocked` with reason `invalid workdir`.

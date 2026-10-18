@@ -37,8 +37,8 @@ class PinnedPermissionTests(unittest.TestCase):
             timeout_s=30,
         )
         self.assertEqual(
-            argv[:5],
-            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict"],
+            argv[:7],
+            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict", "--output-format", "streaming-messages-json"],
         )
 
         omitted = _runner()
@@ -49,10 +49,10 @@ class PinnedPermissionTests(unittest.TestCase):
             timeout_s=30,
         )
         self.assertEqual(
-            pinned[:5],
-            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict"],
+            pinned[:7],
+            ["grok", "--permission-mode", "dontAsk", "--sandbox", "strict", "--output-format", "streaming-messages-json"],
         )
-        self.assertEqual(pinned[5:7], ["--prompt-file", "prompt.md"])
+        self.assertEqual(pinned[7:9], ["--prompt-file", "prompt.md"])
 
     def test_banned_and_unknown_permission_flags_are_rejected(self) -> None:
         banned = [

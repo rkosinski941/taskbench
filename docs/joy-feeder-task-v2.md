@@ -135,12 +135,11 @@ moves a packet between states, and every change goes in the run log.
     (`blocked`, reason `invalid workdir`). The resolved folder is the project
     root for the allow-list, `INSTRUCTIONS.md`, `.taskbench` logs,
     `LAST_AGENT.md`, and the project allow-rule scan. The resolved path is
-    shown on the task and in the approval prompt. `from: web-ui` may use a
-    new valid folder; the watcher registers it in taskbench's local state,
-    not in the repo. Any other sender may use only a folder already in that
-    registry. An unregistered bot folder goes to `needs-approval` (the page
-    shows **Needs you**) with the resolved path, and it is not registered
-    until the owner approves that folder. Denying it does not register it.
+    shown on the task and in the approval prompt. `from` is not a trust
+    signal. A packet, including one with `from: web-ui`, never registers a
+    folder. An unregistered folder goes to `needs-approval` (the page shows
+    **Needs you**) with the resolved path. The owner registers it only
+    through the local UI endpoint. Denying it does not register it.
 
 ## Examples
 

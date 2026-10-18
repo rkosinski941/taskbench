@@ -23,6 +23,14 @@ def emit(payload: dict) -> None:
     sys.stdout.flush()
 
 
+def emit_init(mode: str) -> None:
+    """Documented streaming-messages init line. Not a TASKBENCH line."""
+    sys.stdout.write(
+        json.dumps({"type": "system", "subtype": "init", "permissionMode": mode}) + "\n"
+    )
+    sys.stdout.flush()
+
+
 def read_prompt(path: str | None) -> str:
     if not path:
         return ""
@@ -227,12 +235,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="model-b")
     parser.add_argument("--permission-mode", default="dontAsk")
     parser.add_argument("--sandbox", default="strict")
+    parser.add_argument("--output-format", default="streaming-messages-json")
     args = parser.parse_args(argv)
     prompt = read_prompt(args.prompt_file)
     marker = Path(args.marker_dir) if args.marker_dir else Path(".")
     scenario = args.scenario
     if scenario == "sleeper":
         return scenario_sleeper(marker, args.role)
+    if scenario == "bad-permission":
+        emit_init("always-approve")
+        emit({"type": "result", "summary": "should not finish", "artifacts": []})
+        emit({"type": "done"})
+        time.sleep(30)
+        return 0
+    if scenario == "init-no-mode":
+        sys.stdout.write(json.dumps({"type": "system", "subtype": "init"}) + "\n")
+        sys.stdout.flush()
+        emit({"type": "result", "summary": "should not finish", "artifacts": []})
+        emit({"type": "done"})
+        return 0
+    if scenario == "text-before-init":
+        emit({"type": "result", "summary": "too soon", "artifacts": []})
+        emit({"type": "done"})
+        return 0
+    if scenario not in {"tree", "server", "hang", "exit-no-result"}:
+        emit_init(args.permission_mode)
     if scenario == "tree":
         return scenario_tree(marker)
     if scenario == "server":
@@ -283,12 +310,6 @@ def main(argv: list[str] | None = None) -> int:
         return scenario_retro(prompt)
     if scenario == "preview":
         return scenario_preview(args.command)
-    if scenario == "bad-permission":
-        emit({"type": "permission_mode", "mode": "always-approve", "sandbox": "strict"})
-        emit({"type": "result", "summary": "should not finish", "artifacts": []})
-        emit({"type": "done"})
-        time.sleep(30)
-        return 0
     if scenario == "ok-permission":
         emit({"type": "permission_mode", "mode": "dontAsk", "sandbox": "strict"})
         emit({"type": "runner", "runner": "grok-build"})
