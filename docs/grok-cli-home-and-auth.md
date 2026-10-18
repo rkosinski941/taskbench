@@ -88,10 +88,14 @@ home:
 - `var/grok-home/.grok/config.toml`
 - `var/grok-home/config.toml`
 
-The deny list is `Read(<path>)` and `Read(<path>/**)` for the pinned home
-and for the real profile's `.grok` and `.claude` (from `HOME` and
-`USERPROFILE` before those variables are replaced, plus forward-slash forms
-when the path contains backslashes). The rules do not set `defaultMode`.
+The TOML files use `[permission]` (singular). That is the section in
+<https://docs.x.ai/build/settings/reference>. The JSON file keeps the
+Claude-compatible `permissions` object. The deny list is `Read(<path>)` and
+`Read(<path>/**)` for the pinned home and for the real profile's `.grok` and
+`.claude` (from `HOME` and `USERPROFILE` before those variables are replaced,
+plus forward-slash forms when the path contains backslashes). On Windows each
+path is also written with the drive and the rest of the path lowercased.
+The rules do not set `defaultMode`.
 They are not a project `.claude/settings.json`. `docs/laptop-test-plan.md`
 says how to confirm Grok's own read tools deny those paths: the denial is
 in `var\runtime\<id>.raw.log`, and **Needs you** does not count.

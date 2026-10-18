@@ -127,9 +127,10 @@ can still answer; the dead process group is killed first.
   and `auth.json` is not copied. `copy_auth_json: true` is an explicit
   opt-in. Copying auth.json is on only when that flag is true. A session
   token outranks `XAI_API_KEY`. API-key-only is the default and the safer
-  choice. The page shows that warning when the flag is on. In every mode
-  the pinned home gets deny-read rules so Grok's own read tools cannot open
-  the pinned home or the real profile's `.grok` and `.claude`. Redaction of
+  choice. The page shows a banner, `copy_auth_json is on`, when the flag is
+  on. In every mode the pinned home gets deny-read rules under `[permission]`
+  (https://docs.x.ai/build/settings/reference) so Grok's own read tools cannot
+  open the pinned home or the real profile's `.grok` and `.claude`. Redaction of
   published text is best-effort (zero-width characters, case, and base64 of
   known secrets). It is not a boundary: backslash-u escapes, secrets split
   across lines, and tokens taskbench never saw can still pass. A shell

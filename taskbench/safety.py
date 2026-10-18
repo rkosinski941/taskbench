@@ -26,7 +26,7 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-from taskbench.permissions import banned_permission_in_text
+from taskbench.permissions import banned_permission_in_text, command_warning_text
 
 READ_ONLY_OPS = {"list", "read", "diff"}
 _META = ("&&", "||", ";", "|", "`", "$(", "\n", "&")
@@ -76,13 +76,21 @@ def classify(
 ) -> Decision:
     op = str(action.get("op") or "")
     command = full_command(action)
+    warning = ""
     if op not in READ_ONLY_OPS and op != "write":
         banned = banned_permission_in_text(command)
         if banned:
             return Decision("refuse", banned)
+        warning = command_warning_text(command)
     patterns = list(allow or [])
     server = is_long_lived(action, command)
     plan_like = sandbox_only or permissions == "plan"
+
+    def finish(decision: Decision) -> Decision:
+        """A hidden flag still needs approval, with the warning in the prompt."""
+        if warning and decision.kind != "refuse":
+            return Decision("approve", "command needs approval: " + warning)
+        return decision
 
     if _hits_denied(project_dir, action, denied_dirs or []):
         return Decision("refuse", "path is inside a denied directory")
@@ -98,10 +106,10 @@ def classify(
             and _allow_match(command, patterns)
             and binds_loopback_only(command)
         ):
-            return Decision("allow", "allow-list")
+            return finish(Decision("allow", "allow-list"))
         if permissions == "allow-list" and _allow_match(command, patterns):
             return Decision("refuse", "server must bind 127.0.0.1")
-        return Decision("approve", "server or background process needs approval")
+        return finish(Decision("approve", "server or background process needs approval"))
 
     if op in READ_ONLY_OPS:
         if _path_inside(project_dir, action):
@@ -116,8 +124,8 @@ def classify(
         return Decision("approve", "write needs approval")
 
     if permissions == "allow-list" and _allow_match(command, patterns):
-        return Decision("allow", "allow-list")
-    return Decision("approve", "command needs approval")
+        return finish(Decision("allow", "allow-list"))
+    return finish(Decision("approve", "command needs approval"))
 
 
 def is_long_lived(action: dict, command: str) -> bool:

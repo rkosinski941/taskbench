@@ -140,6 +140,9 @@ class App:
         self.watcher_thread: threading.Thread | None = None
         self.worker_down = False
         self.worker_down_reason = ""
+        self.tick_failures = 0
+        self.tick_started: float | None = None
+        self.last_tick_ok: float | None = None
         from taskbench.redact import remember_secret
 
         remember_secret(self.login_token)
@@ -156,19 +159,48 @@ class App:
         """The one-time URL expires on first use and after ``login_ttl_s``."""
         return time.monotonic() - self.login_issued > self.config.login_ttl_s
 
-    def watcher_healthy(self) -> bool:
-        """True when no supervised watcher has died.
+    # Five failures in a row, or no successful tick for this long, is down.
+    TICK_FAILURE_LIMIT = 5
+    TICK_SUCCESS_WINDOW_S = 30.0
 
-        Unit tests tick the watcher themselves and never attach a thread.
-        That is healthy. The ``run`` command attaches the thread; if it
-        stops, the page is not healthy.
-        """
+    def begin_watch(self) -> None:
+        """Start the clock for a supervised watcher loop."""
+        self.tick_started = time.monotonic()
+        self.last_tick_ok = None
+        self.tick_failures = 0
+
+    def note_tick_ok(self) -> None:
+        self.tick_failures = 0
+        self.last_tick_ok = time.monotonic()
+
+    def note_tick_failure(self) -> None:
+        self.tick_failures += 1
+
+    def watcher_problem(self) -> str:
+        """Why ``/health`` is 503, or an empty string when the watcher is up."""
         if self.worker_down:
-            return False
+            return self.worker_down_reason or "watcher is down"
+        if self.tick_failures >= self.TICK_FAILURE_LIMIT:
+            return "watcher tick is failing"
+        started = self.tick_started
+        if started is not None:
+            anchor = self.last_tick_ok if self.last_tick_ok is not None else started
+            if time.monotonic() - anchor > self.TICK_SUCCESS_WINDOW_S:
+                return "watcher has not completed a tick"
         thread = self.watcher_thread
-        if thread is None:
-            return True
-        return thread.is_alive()
+        if thread is not None and not thread.is_alive():
+            return self.worker_down_reason or "watcher is down"
+        return ""
+
+    def watcher_healthy(self) -> bool:
+        """True when the supervised watcher is alive and ticking.
+
+        Unit tests tick the watcher themselves and never call
+        ``begin_watch``. That stays healthy. Repeated tick errors, or no
+        successful tick inside the window, are not healthy even while the
+        thread is still alive.
+        """
+        return self.watcher_problem() == ""
 
 
 def login_url(app: App, port: int) -> str:
@@ -396,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
             body = b'{"watcher":"up"}\n'
             self._send(200, "application/json", body, None)
             return
-        reason = app.worker_down_reason or "watcher is down"
+        reason = app.watcher_problem() or "watcher is down"
         payload = json.dumps({"watcher": "down", "reason": reason}, separators=(",", ":")).encode("utf-8") + b"\n"
         self._send(503, "application/json", payload, None)
 
@@ -680,6 +712,16 @@ def _card(app: App, packet: dict[str, Any], token: str, queued: dict[str, Any] |
         title = "Use this folder" if workdir_trust else approval_title(command)
         parts.append(f"<h3 class='approval-title'>{html.escape(title)}</h3>")
         parts.append(_folder_line(app, packet))
+        if not workdir_trust:
+            from taskbench.permissions import command_warning_text
+
+            warning = command_warning_text(command)
+            if warning:
+                parts.append(
+                    "<p class='approval-warning' data-approval-warning='1'>"
+                    + html.escape(warning)
+                    + "</p>"
+                )
         parts.append(f"<pre class='command'>{html.escape(command)}</pre>")
         if diff:
             parts.append(f"<pre class='diff'>{html.escape(diff)}</pre>")
@@ -745,7 +787,7 @@ def _page_start(tailscale_user: str | None, app: App | None = None) -> str:
         "pre.command,pre.diff{max-height:12rem;overflow:auto;white-space:pre-wrap;"
         "word-break:break-word;background:#f6f6f6;padding:.5rem}"
         ".sandbox-banner{background:#fff3cd;padding:.5rem}"
-        ".watcher-down,.auth-warning{background:#f8d7da;padding:.5rem}"
+        ".watcher-down,.auth-warning,.approval-warning{background:#f8d7da;padding:.5rem}"
         "</style></head><body><h1>taskbench</h1>"
         "<p>Local runner. Artifacts are files. There is no preview pane.</p>"
         + banner_html
@@ -765,7 +807,8 @@ def _status_banners(app: App | None) -> str:
         )
     if app.config.copy_auth_json:
         parts.append(
-            "<p class='auth-warning'>Copying auth.json is on. A session token "
+            "<p class='auth-warning' role='alert' data-copy-auth='on'>"
+            "copy_auth_json is on. Copying auth.json is on. A session token "
             "outranks XAI_API_KEY. API-key-only is the default and the safer choice.</p>"
         )
     return "".join(parts)

@@ -140,6 +140,17 @@ def supervise(
     return 1 if app.worker_down else 0
 
 
+def watch_once(app: App) -> None:
+    """Run one watcher tick and record success or failure for ``/health``."""
+    try:
+        app.watcher.tick()
+    except Exception:
+        traceback.print_exc()
+        app.note_tick_failure()
+    else:
+        app.note_tick_ok()
+
+
 def _watch(app: App) -> int:
     """Tick on the main thread. This command does not start the page."""
     stop = threading.Event()
@@ -187,11 +198,9 @@ def _run(app: App) -> int:
     _print_startup(app, port)
 
     def watch() -> None:
+        app.begin_watch()
         while not stop.is_set():
-            try:
-                app.watcher.tick()
-            except Exception:
-                traceback.print_exc()
+            watch_once(app)
             if stop.is_set():
                 break
             stop.wait(app.config.poll_interval_s)

@@ -21,6 +21,7 @@ directory and the real profile's ``.grok`` and ``.claude``.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -178,7 +179,8 @@ def banned_permission_in_text(text: str) -> str | None:
     The check tokenizes the whole string, including the payload of
     ``sh -c``, ``cmd /c``, and ``powershell -c``. A clean command is not
     approved by this function; callers still require an approval or an
-    allow-list match.
+    allow-list match. Caret escapes and encoded payloads are reported by
+    ``command_warnings`` instead of being treated as a clean command.
     """
     if not text:
         return None
@@ -187,6 +189,111 @@ def banned_permission_in_text(text: str) -> str | None:
     except PermissionFlagError as exc:
         return str(exc)
     return None
+
+
+def command_warnings(text: str) -> list[str]:
+    """Warnings for a command that still needs a human approval.
+
+    These are not a clean allow-list match. A plain banned flag is still a
+    refusal from ``banned_permission_in_text``. A hidden one is named here
+    so the approval prompt can show it.
+    """
+    if not text:
+        return []
+    return _command_warnings(text, depth=0)
+
+
+def command_warning_text(text: str) -> str:
+    """One sentence for the approval prompt, or an empty string."""
+    return " ".join(command_warnings(text))
+
+
+# GROK_* variables that change sandbox or tool approval. GROK_YOLO is included
+# even though the public env table does not list it: an inline assignment
+# would bypass the pins if it were honored.
+_PERMISSION_ENV = re.compile(
+    r"(?i)(?:^|[\s;&|`$])(?:\$env:)?GROK_"
+    r"(?:YOLO|PERMISSION[A-Z0-9_]*|SANDBOX[A-Z0-9_]*|ALWAYS_APPROVE|AUTO_APPROVE|"
+    r"BYPASS[A-Z0-9_]*|DEFAULT_SELECTED_PERMISSION|REMEMBER_TOOL_APPROVALS|"
+    r"SANDBOX_AUTO_ALLOW_BASH)"
+    r"\b"
+)
+_CARET_HIDDEN = re.compile(r"\^[^\s\r\n]")
+_EXPANSION = re.compile(
+    r"(?i)(?:\$[A-Za-z_{]|(?<![\w])@[A-Za-z_][A-Za-z0-9_]*|%[^%\s]+%|![^!\s]+!)"
+)
+_ENCODED = re.compile(
+    r"(?i)(?:powershell|pwsh)(?:\.exe)?\b[\s\S]{0,240}?"
+    r"-(?:encodedcommand|enc)\b(?:\s+|=|:)?[\"']?([A-Za-z0-9+/=]+)"
+)
+
+
+def _command_warnings(text: str, depth: int) -> list[str]:
+    found: list[str] = []
+    stripped = _strip_cmd_carets(text)
+    if _CARET_HIDDEN.search(text):
+        found.append("caret escape can hide the command or a permission flag")
+        banned = banned_permission_in_text(stripped)
+        if banned:
+            found.append(f"after removing carets: {banned}")
+    if depth == 0 and _ENCODED.search(text):
+        found.append("PowerShell -EncodedCommand hides the command")
+        for decoded in _decode_powershell_encoded(text):
+            banned = banned_permission_in_text(decoded)
+            if banned:
+                found.append(f"decoded command: {banned}")
+            found.extend(_command_warnings(decoded, depth + 1))
+    if _EXPANSION.search(text):
+        found.append(
+            "variable expansion or @args splatting is unknown and needs approval"
+        )
+    if _PERMISSION_ENV.search(text) or _PERMISSION_ENV.search(stripped):
+        found.append("inline GROK_* variable can change Grok permissions")
+    if _grok_config_override(stripped):
+        found.append("command points Grok at another config")
+    unique: list[str] = []
+    for item in found:
+        if item not in unique:
+            unique.append(item)
+    return unique
+
+
+def _strip_cmd_carets(text: str) -> str:
+    """Remove cmd.exe ``^`` escapes. ``^^`` becomes one caret."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "^" and index + 1 < len(text) and text[index + 1] not in "\r\n":
+            out.append(text[index + 1])
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _decode_powershell_encoded(text: str) -> list[str]:
+    decoded: list[str] = []
+    for match in _ENCODED.finditer(text):
+        blob = match.group(1)
+        try:
+            raw = base64.b64decode(blob, validate=True)
+            text_out = raw.decode("utf-16-le", errors="replace")
+        except (ValueError, UnicodeError):
+            continue
+        if text_out and text_out not in decoded:
+            decoded.append(text_out)
+    return decoded
+
+
+def _grok_config_override(text: str) -> bool:
+    """True when a grok executable is passed ``-c`` or ``--config``."""
+    flat = _flatten_command(text)
+    names = {Path(part).name.lower() for part in flat}
+    if not names.intersection({"grok", "grok.exe", "grok.cmd"}):
+        return False
+    return any(name in {"c", "config"} for name, _value in iter_flags(flat))
 
 
 def _flatten_command(text: str, depth: int = 0) -> list[str]:
@@ -614,12 +721,16 @@ def write_grok_deny_rules(home: Path, base_env: dict[str, str]) -> None:
     pinned home and the real profile's ``.grok`` and ``.claude`` (from
     ``HOME`` and ``USERPROFILE`` before those variables are replaced). They
     do not set ``defaultMode`` and they do not copy the user's allow list.
+
+    The TOML section is ``[permission]`` (singular), which is the key in
+    https://docs.x.ai/build/settings/reference . The Claude-compatible JSON
+    file keeps ``permissions``.
     """
     patterns = _read_deny_patterns(_deny_read_targets(home, base_env))
     if not patterns:
         return
     settings = json.dumps({"permissions": {"deny": patterns}}, indent=2).encode("utf-8") + b"\n"
-    lines = ["[permissions]", "deny = ["]
+    lines = ["[permission]", "deny = ["]
     lines.extend(f"  {json.dumps(item)}," for item in patterns)
     lines.append("]")
     lines.append("")
@@ -645,12 +756,25 @@ def _deny_read_targets(home: Path, base_env: dict[str, str]) -> list[str]:
     return seen
 
 
-def _read_deny_patterns(targets: list[str]) -> list[str]:
+def _read_deny_patterns(targets: list[str], *, windows_case: bool | None = None) -> list[str]:
+    """``Read`` rules for each path, plus a lowercased copy on Windows.
+
+    Windows paths are matched case-insensitively by the filesystem, so the
+    lowercased drive and path are written beside the original. Other
+    platforms write the path as given.
+    """
+    if windows_case is None:
+        windows_case = os.name == "nt"
     patterns: list[str] = []
     for raw in targets:
         forms = [raw]
         if "\\" in raw:
             forms.append(raw.replace("\\", "/"))
+        if windows_case:
+            extra = [form.lower() for form in list(forms)]
+            for form in extra:
+                if form not in forms:
+                    forms.append(form)
         for form in forms:
             for pattern in (f"Read({form})", f"Read({form}/**)"):
                 if pattern not in patterns:
