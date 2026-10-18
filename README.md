@@ -95,16 +95,23 @@ can still answer; the dead process group is killed first.
   the argv taskbench launched. That check does not exist on Windows.
 - Before each run, on every OS, taskbench scans the workdir and each
   parent up to the user profile or the drive root, whichever comes first.
-  It reads `.grok/config.toml`, `.claude/settings.json`, and
-  `.claude/settings.local.json`, including nested directories, and follows
-  a symlinked or junctioned `.grok` or `.claude` folder to its target.
-  Keys and values are matched case-insensitively with `tomllib` and
-  `json`. A non-empty `allow`, a true `yolo` / `always-approve` /
-  `auto-approve` / `bypassPermissions`, or a `permission_mode` /
-  `defaultMode` other than `dontAsk` blocks the task. A settings file that
-  cannot be read or parsed blocks the task too. The status stays
-  `blocked`. The page shows **Needs you** and names the file and the rule
-  keys, not the rule values. Deny-only files still run. On Linux and macOS,
+  It reads `.grok/config.toml`, `.claude/settings.json`,
+  `.claude/settings.local.json`, and `.cursor` `mcp.json` / `hooks.json`,
+  including nested directories, and follows a symlinked or junctioned
+  `.grok`, `.claude`, or `.cursor` folder to its target. Keys and values
+  are matched case-insensitively with `tomllib` and `json`. A non-empty
+  `allow`, a true `yolo` / `always-approve` / `auto-approve` /
+  `bypassPermissions`, or a `permission_mode` / `defaultMode` other than
+  `dontAsk` blocks the task. So does a file that defines MCP servers,
+  plugins, or hooks: Grok can run those without a tool call, and Windows
+  has no sandbox. A settings file that cannot be read or parsed blocks the
+  task too. The status stays `blocked`. The page shows **Needs you** and
+  names the file and the keys, not the values. Deny-only files still run.
+  The Grok process sets `GROK_CLAUDE_HOOKS_ENABLED`,
+  `GROK_CURSOR_HOOKS_ENABLED`, `GROK_CLAUDE_MCPS_ENABLED`, and
+  `GROK_CURSOR_MCPS_ENABLED` to `0`. The pinned TOML sets `hooks` and
+  `mcps` false under `[compat.claude]` and `[compat.cursor]`
+  (https://docs.x.ai/build/settings/reference). On Linux and macOS,
   `HOME` is left as the real profile so `--sandbox strict` still applies.
   `GROK_HOME` is still pointed at the pinned directory on those systems.
   `--permission-mode dontAsk` overrides a config `permission_mode`
@@ -173,12 +180,18 @@ v1 implements the Grok Build adapter. Antigravity and opencode are stubs:
 packets that request them are `blocked` and the process is not started.
 
 Set `executable` and `args_template` yourself. Placeholders are
-`{prompt_file}`, `{project_dir}`, and `{timeout_s}`. taskbench puts
-`--permission-mode dontAsk`, `--sandbox strict`, and
+`{prompt_file}`, `{project_dir}`, and `{timeout_s}`. The example template
+passes the prompt with `--prompt-file`. That flag, and `-p, --single` for
+an inline prompt, are the headless flags in the Grok user guide. There is
+no `--prompt` flag. Change the `--prompt-file` string in `args_template`
+if `grok --help` prints a different name. That is config, not a code change.
+See <https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md>.
+taskbench puts `--permission-mode dontAsk`, `--sandbox strict`, and
 `--output-format streaming-messages-json` first, after the executable,
 and refuses other permission flags and `--`. The child gets
-`TASKBENCH_APPROVALS=1` and no Grok variables from the parent. On Windows
-those config-dir variables are then set to the empty grok home. How that
+`TASKBENCH_APPROVALS=1` and no Grok variables from the parent, then the
+four scanner locks above set to `0`. On Windows those config-dir variables
+are then set to the empty grok home. How that
 home is chosen, and how auth is seeded, is `docs/grok-cli-home-and-auth.md`.
 The real CLI's permission check is the init event described above. The
 `TASKBENCH` lines below are the action protocol the test stub speaks.

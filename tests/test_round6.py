@@ -53,6 +53,10 @@ class DenySectionTests(unittest.TestCase):
             parsed = tomllib.loads(text)
             self.assertIn("permission", parsed)
             self.assertNotIn("permissions", parsed)
+            for side in ("claude", "cursor"):
+                compat = parsed["compat"][side]
+                self.assertIs(compat["hooks"], False)
+                self.assertIs(compat["mcps"], False)
             deny = parsed["permission"]["deny"]
             self.assertTrue(deny)
             self.assertTrue(all(item.startswith("Read(") for item in deny))
@@ -233,8 +237,9 @@ class LaptopPlanPowerShellTests(unittest.TestCase):
         self.assertIn("$env:USERPROFILE", plan)
         self.assertIn("[permission]", plan)
         self.assertIn('allow = ["Bash(echo TASKBENCH-PROBE*)"]', plan)
-        self.assertIn("-p", plan)
-        self.assertIn("--prompt", plan)
+        self.assertIn("-p, --single", plan)
+        self.assertIn("--prompt-file", plan)
+        self.assertIsNone(__import__("re").search(r"grok --prompt(?!-file)", plan))
         self.assertIn("--permission-mode dontAsk", plan)
         self.assertIn("--output-format streaming-messages-json", plan)
         self.assertIn("Read-Host -AsSecureString", plan)

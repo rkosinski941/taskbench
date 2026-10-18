@@ -20,6 +20,12 @@ ship a real `grok` binary, and these tests do not launch one.
   `end`) do not document `permissionMode`. taskbench therefore pins
   `streaming-messages-json`, not `streaming-json`.
   <https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md>
+- The same guide's flag table lists `-p, --single` for an inline prompt
+  and `--prompt-file` for a prompt file. Both trigger headless mode. There
+  is no `--prompt` flag. `--cwd` sets the working directory. taskbench's
+  example `args_template` passes `--prompt-file` and `{prompt_file}`. The
+  flag name is that config string. If `grok --help` prints a different
+  prompt-file flag, change the string. No code change.
 - That guide says `permissionMode` is the `--permission-mode` value, or
   `bypassPermissions` under `--yolo`, otherwise `default`. It says Grok-only
   modes such as `auto` collapse to `default`. The sample init line is

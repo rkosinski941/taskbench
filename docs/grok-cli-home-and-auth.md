@@ -89,8 +89,17 @@ home:
 - `var/grok-home/config.toml`
 
 The TOML files use `[permission]` (singular). That is the section in
-<https://docs.x.ai/build/settings/reference>. The JSON file keeps the
-Claude-compatible `permissions` object. The deny list is `Read(<path>)` and
+<https://docs.x.ai/build/settings/reference>. The same page lists `hooks`
+and `mcps` under `[compat.claude]` and `[compat.cursor]`, both defaulting
+to true. The pinned TOML sets each of those four keys to false. The Grok
+process also sets `GROK_CLAUDE_HOOKS_ENABLED=0`,
+`GROK_CURSOR_HOOKS_ENABLED=0`, `GROK_CLAUDE_MCPS_ENABLED=0`, and
+`GROK_CURSOR_MCPS_ENABLED=0`, which that page documents as the scanner
+switches (default on). A repo `.grok/config.toml` can still contribute
+`[mcp_servers]` and `[plugins]`, and Claude or Cursor settings can define
+hooks and MCP servers. taskbench sends that task to Needs you and names
+the file and the keys. The JSON file keeps the Claude-compatible
+`permissions` object. The deny list is `Read(<path>)` and
 `Read(<path>/**)` for the pinned home and for the real profile's `.grok` and
 `.claude` (from `HOME` and `USERPROFILE` before those variables are replaced,
 plus forward-slash forms when the path contains backslashes). On Windows each

@@ -8,7 +8,12 @@ from pathlib import Path
 
 from taskbench.adapters.grok_build import GrokBuildAdapter
 from taskbench.config import ConfigError, RunnerConfig, load_config
-from taskbench.permissions import PermissionFlagError, check_permission_args, scrub_environment
+from taskbench.permissions import (
+    GROK_SCANNER_DISABLES,
+    PermissionFlagError,
+    check_permission_args,
+    scrub_environment,
+)
 from taskbench.process_tree import ManagedProcess, ProcessTreeError
 from taskbench.task_format import parse_yaml
 from tests.support import ROOT, TempApp, base_packet, packet_status, run_until, write_packet
@@ -141,7 +146,10 @@ class PinnedPermissionTests(unittest.TestCase):
         adapter_env = GrokBuildAdapter(_runner()).environment(os.environ.copy())
         self.assertEqual(adapter_env["TASKBENCH_APPROVALS"], "1")
         self.assertNotIn("PYTHONPATH", {key.upper() for key in adapter_env})
-        self.assertFalse(any(key.upper().startswith("GROK_") for key in adapter_env))
+        grok_keys = {key for key in adapter_env if key.upper().startswith("GROK_")}
+        self.assertEqual(grok_keys, set(GROK_SCANNER_DISABLES))
+        for key, value in GROK_SCANNER_DISABLES.items():
+            self.assertEqual(adapter_env[key], value)
 
 
 class RunnerReactionTests(TempApp):

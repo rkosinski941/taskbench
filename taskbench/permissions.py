@@ -16,7 +16,9 @@ taskbench directory recreated before each run. On Windows, ``HOME`` and
 On Linux and macOS those two stay as the real profile so ``--sandbox strict``
 still applies. API-key-only is the default: ``auth.json`` is copied only when
 ``copy_auth_json`` is set. Deny-read rules in the pinned home name that
-directory and the real profile's ``.grok`` and ``.claude``.
+directory and the real profile's ``.grok`` and ``.claude``. The same TOML
+turns ``[compat.claude]`` and ``[compat.cursor]`` hooks and MCP off, and the
+Grok process gets those four scanner variables set to ``0``.
 """
 
 from __future__ import annotations
@@ -113,11 +115,24 @@ class PermissionFlagError(ValueError):
     """A permission flag is banned or not on the allow-list."""
 
 
+# Grok's Claude and Cursor scanners default to on. A repo can then start MCP
+# servers, plugins, or hooks without a tool call for taskbench to deny.
+# https://docs.x.ai/build/settings/reference lists these four variables.
+GROK_SCANNER_DISABLES = {
+    "GROK_CLAUDE_HOOKS_ENABLED": "0",
+    "GROK_CURSOR_HOOKS_ENABLED": "0",
+    "GROK_CLAUDE_MCPS_ENABLED": "0",
+    "GROK_CURSOR_MCPS_ENABLED": "0",
+}
+
+
 def scrub_environment(base: dict[str, str]) -> dict[str, str]:
     """Copy only allow-listed variables. Never pass ``PYTHONPATH`` or ``GROK_*``.
 
     ``XAI_API_KEY`` is not on this list. The guarded Grok launch adds it to
     that one process. Companion dev servers stay on this allow-list.
+    ``apply_grok_scanner_locks`` sets the four scanner switches after this
+    scrub, and only on the Grok process. Parent ``GROK_*`` values are not copied.
     """
     from taskbench.redact import drop_from_env
 
@@ -128,6 +143,18 @@ def scrub_environment(base: dict[str, str]) -> dict[str, str]:
             env[key] = value
     env["TASKBENCH_APPROVALS"] = "1"
     return drop_from_env(env)
+
+
+def apply_grok_scanner_locks(env: dict[str, str]) -> dict[str, str]:
+    """Force the Claude and Cursor hook and MCP scanners off.
+
+    Call this on the filtered Grok environment, after ``scrub_environment``.
+    A parent value of ``1`` does not survive the scrub, and this overwrites
+    the four names so the child cannot inherit them.
+    """
+    locked = dict(env)
+    locked.update(GROK_SCANNER_DISABLES)
+    return locked
 
 
 def normalize_flag_name(token: str) -> str | None:
@@ -723,7 +750,9 @@ def write_grok_deny_rules(home: Path, base_env: dict[str, str]) -> None:
     do not set ``defaultMode`` and they do not copy the user's allow list.
 
     The TOML section is ``[permission]`` (singular), which is the key in
-    https://docs.x.ai/build/settings/reference . The Claude-compatible JSON
+    https://docs.x.ai/build/settings/reference . That page also names
+    ``hooks`` and ``mcps`` under ``[compat.claude]`` and ``[compat.cursor]``
+    (default true). Both are set false here. The Claude-compatible JSON
     file keeps ``permissions``.
     """
     patterns = _read_deny_patterns(_deny_read_targets(home, base_env))
@@ -734,6 +763,18 @@ def write_grok_deny_rules(home: Path, base_env: dict[str, str]) -> None:
     lines.extend(f"  {json.dumps(item)}," for item in patterns)
     lines.append("]")
     lines.append("")
+    lines.extend(
+        [
+            "[compat.claude]",
+            "hooks = false",
+            "mcps = false",
+            "",
+            "[compat.cursor]",
+            "hooks = false",
+            "mcps = false",
+            "",
+        ]
+    )
     toml = "\n".join(lines).encode("utf-8")
     _write_private(Path(home) / ".claude" / "settings.json", settings)
     _write_private(Path(home) / ".grok" / "config.toml", toml)
@@ -815,6 +856,20 @@ _PROJECT_SETTINGS = {
     (".grok", "config.toml"),
     (".claude", "settings.json"),
     (".claude", "settings.local.json"),
+    (".claude", "mcp.json"),
+    (".claude", "hooks.json"),
+    (".cursor", "mcp.json"),
+    (".cursor", "hooks.json"),
+}
+
+# Files that sit in the directory itself, not inside one of the folders above.
+_DIRECT_SETTINGS = (".mcp.json", "mcp.json", "hooks.json")
+
+# A file with this name defines that feature when its body is non-empty.
+_FILE_EXEC = {
+    "mcp.json": "mcp_servers",
+    ".mcp.json": "mcp_servers",
+    "hooks.json": "hooks",
 }
 
 _RULE_CANONICAL = {
@@ -891,6 +946,54 @@ def _mode_is_problem(value: object) -> bool:
     return text != "dontask"
 
 
+def _exec_canon(key: str) -> str | None:
+    """MCP, plugin, and hook keys. Matched without case or separator."""
+    norm = _snake_key(key)
+    if norm in {"mcp_servers", "mcp_server", "mcps"}:
+        return "mcp_servers"
+    if norm in {"plugins", "plugin"}:
+        return "plugins"
+    if norm == "hooks":
+        return "hooks"
+    return None
+
+
+def _defines_exec(value: object) -> bool:
+    """True when a value actually names a server, plugin, or hook.
+
+    ``false`` and empty lists do not. A nested table does: an MCP server
+    entry counts even when its own table is empty. A ``disabled = []``
+    plugins table does not. An empty ``{}`` does not.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
+    if isinstance(value, dict):
+        if not value:
+            return False
+        for item in value.values():
+            if isinstance(item, dict):
+                return True
+            if _defines_exec(item):
+                return True
+        return False
+    return False
+
+
+def _file_defines(data: object) -> bool:
+    """True when a whole ``mcp.json`` or ``hooks.json`` document is non-empty.
+
+    An object whose known list is ``{}`` or ``[]`` does not count. A bare
+    JSON array of hook or server entries does.
+    """
+    if isinstance(data, list):
+        return len(data) > 0
+    if isinstance(data, dict):
+        return any(_defines_exec(item) for item in data.values())
+    return False
+
+
 def _key_is_problem(key: str, value: object) -> bool:
     canon = _canonical_rule_key(key)
     if canon is None:
@@ -902,13 +1005,18 @@ def _key_is_problem(key: str, value: object) -> bool:
     return _truthy_switch(value)
 
 
+def _remember(found: list[str], canon: str | None) -> None:
+    if canon and canon not in found:
+        found.append(canon)
+
+
 def _json_problem_keys(data: object, found: list[str]) -> None:
     if isinstance(data, dict):
         for key, value in data.items():
             if _key_is_problem(str(key), value):
-                canon = _canonical_rule_key(str(key))
-                if canon and canon not in found:
-                    found.append(canon)
+                _remember(found, _canonical_rule_key(str(key)))
+            if _defines_exec(value):
+                _remember(found, _exec_canon(str(key)))
             if isinstance(value, (dict, list)):
                 _json_problem_keys(value, found)
     elif isinstance(data, list):
@@ -939,7 +1047,11 @@ def _read_settings(path: Path, filename: str) -> tuple[list[str] | None, str | N
             data = tomllib.loads(text) if text.strip() else {}
         except tomllib.TOMLDecodeError:
             return None, "unparsed"
-    return _problem_keys_from_data(data), None
+    keys = _problem_keys_from_data(data)
+    extra = _FILE_EXEC.get(filename.casefold())
+    if extra and extra not in keys and _file_defines(data):
+        keys.append(extra)
+    return keys, None
 
 
 def _scan_directories(project: Path) -> list[Path]:
@@ -982,6 +1094,27 @@ def _matching_child(directory: Path, name: str) -> Path | None:
     return None
 
 
+def _record_settings_file(
+    path: Path,
+    filename: str,
+    label: str,
+    findings: list[tuple[str, tuple[str, ...]]],
+    seen: set[str],
+) -> None:
+    if label in seen:
+        return
+    if not path.is_file():
+        return
+    keys, error = _read_settings(path, filename)
+    if error:
+        findings.append((label, (error,)))
+        seen.add(label)
+        return
+    if keys:
+        findings.append((label, tuple(keys)))
+        seen.add(label)
+
+
 def _consider_settings(
     directory: Path,
     label_prefix: str,
@@ -1010,27 +1143,33 @@ def _consider_settings(
             findings.append((label, ("unreadable",)))
             seen.add(label)
             continue
-        if not path.is_file():
+        _record_settings_file(path, filename, label, findings, seen)
+    for filename in _DIRECT_SETTINGS:
+        label = f"{label_prefix}{filename}"
+        if label in seen:
             continue
-        keys, error = _read_settings(path, filename)
-        if error:
-            findings.append((label, (error,)))
+        link = _matching_child(directory, filename)
+        if link is None:
+            continue
+        try:
+            path = Path(os.path.realpath(link, strict=True))
+        except OSError:
+            findings.append((label, ("unreadable",)))
             seen.add(label)
             continue
-        if keys:
-            findings.append((label, tuple(keys)))
-            seen.add(label)
+        _record_settings_file(path, filename, label, findings, seen)
 
 
 def scan_project_permission_rules(project: Path) -> list[tuple[str, tuple[str, ...]]]:
-    """Find settings that would auto-approve tools.
+    """Find settings that would auto-approve tools or start side programs.
 
     Walks the workdir, then each parent up to the profile or the drive root,
     whichever comes first. The profile directory is included. The drive root
-    is not. ``.grok`` and ``.claude`` symlinks and junctions are followed to
-    their targets on every OS. Keys and mode values are matched
-    case-insensitively. Unreadable or unparsed files are findings (Needs you),
-    not skips. Values are not returned.
+    is not. ``.grok``, ``.claude``, and ``.cursor`` symlinks and junctions are
+    followed to their targets on every OS. Keys and mode values are matched
+    case-insensitively. A file that defines MCP servers, plugins, or hooks is
+    a finding, the same as an allow rule. Unreadable or unparsed files are
+    findings (Needs you), not skips. Values are not returned.
     """
     root = Path(project)
     try:
@@ -1059,6 +1198,6 @@ def needs_you_message(findings: list[tuple[str, tuple[str, ...]]]) -> str:
     parts = [f"{rel} [{', '.join(keys)}]" for rel, keys in findings]
     return (
         "Needs you: project settings could not be checked or contain "
-        "auto-approve or allow rules; remove or repair them before this "
-        "task can run: " + "; ".join(parts)
+        "auto-approve or allow rules, or they define MCP servers, plugins, or hooks; "
+        "remove or repair them before this task can run: " + "; ".join(parts)
     )

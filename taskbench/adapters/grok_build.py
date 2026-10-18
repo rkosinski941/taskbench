@@ -45,7 +45,7 @@ from typing import Any
 
 from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import RunnerConfig
-from taskbench.permissions import apply_config_home, ensure_pinned_args
+from taskbench.permissions import apply_config_home, apply_grok_scanner_locks, ensure_pinned_args
 
 
 class GrokBuildAdapter(Adapter):
@@ -82,7 +82,7 @@ class GrokBuildAdapter(Adapter):
         config_home: Path | None = None,
         pin_profile_home: bool = True,
     ) -> dict[str, str]:
-        env = super().environment(base)
+        env = apply_grok_scanner_locks(super().environment(base))
         if config_home is not None:
             env = apply_config_home(env, config_home, pin_profile_home=pin_profile_home)
         return env
