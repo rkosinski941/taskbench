@@ -1,10 +1,13 @@
 """Grok Build adapter.
 
-The real CLI's flags are not published. Configure ``executable`` and
-``args_template`` with placeholders ``{prompt_file}``, ``{project_dir}``, and
-``{timeout_s}``. The template must already put the CLI in plan/ask mode.
-taskbench refuses templates that contain a bypass or yolo flag, and it always
-sets ``TASKBENCH_APPROVALS=1``.
+``args_template`` may use ``{prompt_file}``, ``{project_dir}``, and
+``{timeout_s}``. taskbench always appends ``--permission-mode dontAsk`` and
+``--sandbox strict`` when the template does not already pin them. Other
+permission flags (``--always-approve``, ``--allow``, ``--auto-approve``,
+``--yolo``, and unknown permission flags) are rejected. The child environment
+is an allow-list; ``GROK_*``, ``PYTHONPATH``, and config-home overrides are
+not passed through. ``can_ask`` defaults to false because ``dontAsk`` does
+not ask taskbench.
 
 Assumed stdout protocol, one JSON object per line::
 
@@ -30,7 +33,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from taskbench.adapters.base import Adapter
-from taskbench.config import BANNED_ARG_PARTS, RunnerConfig
+from taskbench.config import RunnerConfig
+from taskbench.permissions import ensure_pinned_args
 
 
 class GrokBuildAdapter(Adapter):
@@ -58,8 +62,4 @@ class GrokBuildAdapter(Adapter):
             for key, value in mapping.items():
                 arg = arg.replace(key, value)
             argv.append(arg)
-        for arg in argv:
-            lowered = arg.lower()
-            if any(part in lowered for part in BANNED_ARG_PARTS):
-                raise ValueError("refusing to launch Grok Build with a bypass flag")
-        return argv
+        return ensure_pinned_args(argv)

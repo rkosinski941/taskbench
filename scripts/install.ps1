@@ -45,28 +45,44 @@ function Get-TaskbenchPort {
     return $port
 }
 
+function Write-ExpectedFunnelCheck {
+    param([int] $Port, [bool] $Executed)
+    Write-Step "Funnel check: tailscale serve status; tailscale serve status --json; tailscale funnel status."
+    Write-Step "Funnel is on when the text says 'Funnel on' or 'Available on the internet', or the JSON Funnel/AllowFunnel value is truthy."
+    Write-Step "Unreadable JSON fails closed on a real run. -WhatIf does not treat a skipped or unreadable check as Funnel on."
+    if (-not $Executed) {
+        Write-Step "Funnel check was not executed because tailscale is not installed. Expected result when Funnel is off: off. This dry run is not a failure."
+        Write-Step "A real run would serve 127.0.0.1:${Port} on the tailnet only after that check."
+    }
+}
+
 function Invoke-FunnelCheck {
     param(
         [string] $ServeText,
         [string] $ServeJson,
         [string] $FunnelText
     )
-    $py = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $py) {
-        $py = Get-Command python3 -ErrorAction SilentlyContinue
-    }
-    if ($py) {
-        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("taskbench-funnel-" + [guid]::NewGuid().ToString("n"))
-        New-Item -ItemType Directory -Path $dir | Out-Null
-        try {
-            $serveFile = Join-Path $dir "serve.txt"
-            $jsonFile = Join-Path $dir "serve.json"
-            $funnelFile = Join-Path $dir "funnel.txt"
-            Set-Content -LiteralPath $serveFile -Value $ServeText -Encoding UTF8
-            Set-Content -LiteralPath $jsonFile -Value $ServeJson -Encoding UTF8
-            Set-Content -LiteralPath $funnelFile -Value $FunnelText -Encoding UTF8
-            $env:PYTHONPATH = $Root
-            $code = @"
+    # -WhatIf must not skip the read-only check or leak PYTHONPATH into this session.
+    $savedWhatIf = $WhatIfPreference
+    $WhatIfPreference = $false
+    $savedPythonPath = [System.Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
+    try {
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $py) {
+            $py = Get-Command python3 -ErrorAction SilentlyContinue
+        }
+        if ($py) {
+            $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("taskbench-funnel-" + [guid]::NewGuid().ToString("n"))
+            [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            try {
+                $serveFile = Join-Path $dir "serve.txt"
+                $jsonFile = Join-Path $dir "serve.json"
+                $funnelFile = Join-Path $dir "funnel.txt"
+                [System.IO.File]::WriteAllText($serveFile, $ServeText)
+                [System.IO.File]::WriteAllText($jsonFile, $ServeJson)
+                [System.IO.File]::WriteAllText($funnelFile, $FunnelText)
+                [System.Environment]::SetEnvironmentVariable("PYTHONPATH", $Root, "Process")
+                $code = @"
 from pathlib import Path
 import sys
 from taskbench.funnel_check import funnel_is_on
@@ -77,14 +93,18 @@ on = funnel_is_on(
 )
 print("on" if on else "off")
 "@
-            $result = & $py.Source -c $code $serveFile $jsonFile $funnelFile
-            if ($LASTEXITCODE -eq 0 -and ($result -eq "on" -or $result -eq "off")) {
-                return ($result -eq "on")
+                $result = & $py.Source -c $code $serveFile $jsonFile $funnelFile
+                if ($LASTEXITCODE -eq 0 -and ($result -eq "on" -or $result -eq "off")) {
+                    return ($result -eq "on")
+                }
+                Write-Step "Python funnel check failed. Falling back to the same text rules."
+            } finally {
+                [System.IO.Directory]::Delete($dir, $true)
             }
-            Write-Step "Python funnel check failed. Falling back to the same text rules, failing closed on unreadable JSON."
-        } finally {
-            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    } finally {
+        [System.Environment]::SetEnvironmentVariable("PYTHONPATH", $savedPythonPath, "Process")
+        $WhatIfPreference = $savedWhatIf
     }
     $combined = "$ServeText`n$FunnelText"
     if ($combined -match '(?i)funnel on|available on the internet') {
@@ -144,7 +164,7 @@ if (-not $existing) {
     Write-Step "This script does not elevate itself and does not call Start-Process -Verb RunAs."
     if (-not $PSCmdlet.ShouldProcess("Tailscale.Tailscale", "winget install --scope user")) {
         Write-Step "WhatIf: skipped winget, tailscale serve, and any Funnel change."
-        Write-Step "A real run would then serve 127.0.0.1:${port} on the tailnet and refuse to continue if Funnel is on."
+        Write-ExpectedFunnelCheck -Port $port -Executed $false
         exit 0
     }
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -170,7 +190,8 @@ if ($funnelOn) {
     Write-Step "FUNNEL IS ON. taskbench will not expose this page to the public internet."
     Write-Step "Command: tailscale funnel off"
     if (-not $PSCmdlet.ShouldProcess("Tailscale Funnel", "turn off")) {
-        throw "WhatIf: Funnel is on. A real run would execute 'tailscale funnel off' and stop if it stayed on. No serve change was made."
+        Write-Step "WhatIf: Funnel is on. A real run would execute 'tailscale funnel off' and stop if it stayed on. No serve change was made."
+        exit 1
     }
     & tailscale funnel off
     if ($LASTEXITCODE -ne 0) {

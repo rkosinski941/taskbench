@@ -11,12 +11,16 @@
       "adapter": "grok_build",
       "executable": "grok",
       "args_template": [
+        "--permission-mode",
+        "dontAsk",
+        "--sandbox",
+        "strict",
         "--prompt-file",
         "{prompt_file}",
         "--cwd",
         "{project_dir}"
       ],
-      "can_ask": true,
+      "can_ask": false,
       "sandbox_only": false
     }
   }

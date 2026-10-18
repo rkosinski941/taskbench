@@ -12,19 +12,34 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from taskbench.permissions import BANNED_CONFIG_KEYS, PermissionFlagError, check_permission_args
+
 BANNED_KEYS = {
     "yolo",
     "bypass",
     "approve_all",
+    "approve-all",
     "auto_approve",
+    "auto-approve",
+    "always_approve",
+    "always-approve",
+    "allow",
     "full_auto",
+    "full-auto",
     "dangerously_skip_permissions",
+    "dangerously-skip-permissions",
     "no_sandbox",
+    "no-sandbox",
     "allow_all",
     "skip_approval",
+    "skip-approval",
     "unrestricted",
     "funnel",
-}
+    "permission_mode",
+    "permission-mode",
+    "bypass_permissions",
+    "bypass-permissions",
+} | {key.replace("-", "_") for key in BANNED_CONFIG_KEYS}
 
 BANNED_ARG_PARTS = (
     "yolo",
@@ -51,7 +66,7 @@ class RunnerConfig:
     adapter: str
     executable: str
     args_template: list[str]
-    can_ask: bool = True
+    can_ask: bool = False
     sandbox_only: bool = False
 
 
@@ -132,16 +147,21 @@ def _load_runners(raw: object) -> dict[str, RunnerConfig]:
             raise ConfigError(f"runner {name} needs an executable")
         if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
             raise ConfigError(f"runner {name} args_template must be a list of strings")
+        try:
+            check_permission_args(list(args))
+        except PermissionFlagError as exc:
+            raise ConfigError(f"runner {name} args_template: {exc}") from exc
         for arg in args:
             lowered = arg.lower()
             if any(part in lowered for part in BANNED_ARG_PARTS):
                 raise ConfigError(f"runner {name} args_template contains a banned flag")
+        default_can_ask = False
         runners[name] = RunnerConfig(
             name=name,
             adapter=adapter,
             executable=executable,
             args_template=list(args),
-            can_ask=bool(body.get("can_ask", True)),
+            can_ask=bool(body.get("can_ask", default_can_ask)),
             sandbox_only=bool(body.get("sandbox_only", False)),
         )
     return runners
@@ -150,7 +170,7 @@ def _load_runners(raw: object) -> dict[str, RunnerConfig]:
 def _reject_banned(value: object) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if str(key).strip().lower() in BANNED_KEYS:
+            if str(key).strip().lower().replace("-", "_") in {item.replace("-", "_") for item in BANNED_KEYS}:
                 raise ConfigError(f"config key '{key}' is not allowed")
             _reject_banned(item)
     elif isinstance(value, list):

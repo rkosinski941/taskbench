@@ -34,15 +34,10 @@ class Adapter(ABC):
         """Return argv. The command must hand approvals to taskbench."""
 
     def environment(self, base: dict[str, str]) -> dict[str, str]:
-        env = dict(base)
-        for key in list(env):
-            upper = key.upper()
-            if "YOLO" in upper or "BYPASS" in upper or upper.endswith("APPROVE_ALL"):
-                env.pop(key, None)
-        env["TASKBENCH_APPROVALS"] = "1"
-        env.pop("TASKBENCH_YOLO", None)
-        env.pop("TASKBENCH_BYPASS", None)
-        return env
+        """Return the child environment. Parent variables are not passed through."""
+        from taskbench.permissions import scrub_environment
+
+        return scrub_environment(base)
 
     def parse_line(self, line: str) -> dict[str, Any] | None:
         stripped = line.strip()

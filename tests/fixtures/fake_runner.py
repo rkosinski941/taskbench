@@ -225,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--length", type=int, default=1)
     parser.add_argument("--role", default="grandchild")
     parser.add_argument("--model", default="model-b")
+    parser.add_argument("--permission-mode", default="dontAsk")
+    parser.add_argument("--sandbox", default="strict")
     args = parser.parse_args(argv)
     prompt = read_prompt(args.prompt_file)
     marker = Path(args.marker_dir) if args.marker_dir else Path(".")
@@ -281,6 +283,19 @@ def main(argv: list[str] | None = None) -> int:
         return scenario_retro(prompt)
     if scenario == "preview":
         return scenario_preview(args.command)
+    if scenario == "bad-permission":
+        emit({"type": "permission_mode", "mode": "always-approve", "sandbox": "strict"})
+        emit({"type": "result", "summary": "should not finish", "artifacts": []})
+        emit({"type": "done"})
+        time.sleep(30)
+        return 0
+    if scenario == "ok-permission":
+        emit({"type": "permission_mode", "mode": "dontAsk", "sandbox": "strict"})
+        emit({"type": "runner", "runner": "grok-build"})
+        emit({"type": "model", "model": "grok-fixture-1"})
+        emit({"type": "result", "summary": "mode accepted", "artifacts": []})
+        emit({"type": "done"})
+        return 0
     if scenario == "read-ok":
         emit({"type": "action", "action": {"op": "read", "path": "INSTRUCTIONS.md"}})
         wait_decision()

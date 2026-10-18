@@ -61,6 +61,18 @@ can still answer; the dead process group is killed first.
 - The page binds to `127.0.0.1` and refuses any other address. `Host` must be
   `127.0.0.1` or `localhost` (with the port), plus names listed in
   `allowed_hosts` (empty by default). POST checks a per-session CSRF cookie.
+- Grok Build is pinned to `--permission-mode dontAsk` and `--sandbox strict`.
+  `can_ask` defaults to false, so `ask` and `allow-list` packets are blocked
+  before the process starts. `--always-approve`, `--yolo`, `--allow`,
+  `--auto-approve`, and any other permission flag are rejected. If the
+  running process reports a different mode or sandbox, taskbench kills it
+  and marks the packet `failed`.
+- The runner's environment is an allow-list (`PATH`, `HOME`, locale, and a
+  few Windows system variables). `GROK_*`, `PYTHONPATH`, `XDG_CONFIG_HOME`,
+  and similar config-home overrides are not passed through.
+- If the Windows job object or the POSIX process group cannot be set up,
+  the task is `failed` and nothing is left running. A sidecar that cannot
+  join that same job or group is killed instead of being left unconfined.
 - There is no config key or CLI flag for bypass, yolo, or auto-approve.
   Runner argument templates that contain those words are rejected.
 - Cancel, timeout, a normal exit, a failure, and watcher shutdown kill the
@@ -83,11 +95,13 @@ can still answer; the dead process group is killed first.
 v1 implements the Grok Build adapter. Antigravity and opencode are stubs:
 packets that request them are `blocked` and the process is not started.
 
-The published Grok Build flags are not part of this repo. Set `executable`
-and `args_template` yourself. Placeholders are `{prompt_file}`,
-`{project_dir}`, and `{timeout_s}`. The template must already put the CLI in
-a mode that proposes actions and waits. taskbench sets `TASKBENCH_APPROVALS=1`
-and strips environment variables whose names contain `YOLO` or `BYPASS`.
+Set `executable` and `args_template` yourself. Placeholders are
+`{prompt_file}`, `{project_dir}`, and `{timeout_s}`. taskbench appends
+`--permission-mode dontAsk` and `--sandbox strict` when the template does
+not already pin them, and it refuses other permission flags. The child gets
+`TASKBENCH_APPROVALS=1` and no other taskbench or Grok variables from the
+parent. `~/.grok` can still exist on disk; the pinned flags are what stop
+an unattended run from inheriting always-approve or a CLI `--allow` rule.
 
 Assumed stdout protocol, one JSON object per line, prefixed with `TASKBENCH `:
 
@@ -150,7 +164,10 @@ and this setup refuses that.
    ```
 
    With no `-WithTailscale` switch the script prints how to start taskbench
-   and exits. It does not install software.
+   and exits. It does not install software. `-WhatIf` still prints the Funnel
+   check it would run (serve status, serve status --json, funnel status).
+   A skipped check is not reported as Funnel on. The script sets `PYTHONPATH`
+   only for the checker process and restores it before returning.
 3. When you want the tailnet proxy, and only then:
 
    ```text

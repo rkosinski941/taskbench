@@ -10,11 +10,14 @@ cannot leave them behind.
 
 Windows creates a Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``,
 assigns the suspended process to it, then resumes the main thread. Closing
-the job or calling ``TerminateJobObject`` kills the tree. If job assignment
-is refused, the fallback is ``taskkill /T /F``, which the spec also allows.
+the job or calling ``TerminateJobObject`` kills the tree. If the job cannot
+be created or the process cannot be assigned, the process is terminated
+before it runs and the task is refused. taskbench does not run unconfined
+and does not fall open to ``taskkill``.
 
 ``spawn_companion`` puts a server or other extra process in the same group
-or job so completion, cancel, timeout, and shutdown kill it too.
+or job. If it cannot join, it is killed and the call fails. Completion,
+cancel, timeout, and shutdown then kill whatever joined.
 """
 
 from __future__ import annotations
@@ -75,11 +78,21 @@ def kill_process_group(pgid: int) -> None:
 
 
 class ManagedProcess:
-    """A child plus the group or job that contains its descendants."""
+    """A child plus the group or job that contains its descendants.
+
+    ``force_confinement_failure`` is a test switch. When set, no process is
+    started. Callers must treat that as a hard refusal.
+    """
+
+    force_confinement_failure = False
 
     def __init__(self, argv: list[str], cwd: Path, env: dict[str, str]) -> None:
         if not argv:
             raise ProcessTreeError("empty argv")
+        if type(self).force_confinement_failure:
+            raise ProcessTreeError(
+                "simulated job or process-group assignment failure"
+            )
         self.argv = list(argv)
         self.cwd = cwd
         self.queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -152,18 +165,39 @@ class ManagedProcess:
         def _join_group() -> None:
             os.setpgid(0, group)
 
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=_join_group,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=_join_group,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProcessTreeError(
+                f"companion failed to join the process group: {exc}"
+            ) from exc
         try:
             os.setpgid(proc.pid, group)
         except OSError:
             pass
+        try:
+            joined = os.getpgid(proc.pid) == group
+        except OSError:
+            joined = False
+        if not joined:
+            try:
+                os.kill(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            raise ProcessTreeError(
+                "refusing sidecar: it did not join the runner process group"
+            )
         self.companions.append(proc)
         return proc.pid
 
@@ -236,21 +270,40 @@ class ManagedProcess:
                 except Exception:
                     pass
 
-        self._proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=_preexec,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=_preexec,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProcessTreeError(f"process-group setup failed: {exc}") from exc
         self._pid = self._proc.pid
-        self._group_id = self._proc.pid
         try:
             os.setpgid(self._pid, self._pid)
         except OSError:
             pass
+        try:
+            pgid = os.getpgid(self._pid)
+        except OSError:
+            pgid = -1
+        if pgid != self._pid:
+            try:
+                os.kill(self._pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            raise ProcessTreeError(
+                f"process-group setup failed for pid {self._pid}; refusing to run unconfined"
+            )
+        self._group_id = pgid
         self._stdin = self._proc.stdin
         self._process_handle = None
         self._job = None
@@ -284,6 +337,19 @@ class ManagedProcess:
 
     def _start_windows(self, argv: list[str], cwd: Path, env: dict[str, str]) -> None:
         _win_start(self, argv, cwd, env)
+
+
+def read_cmdline(pid: int) -> list[str] | None:
+    """Return the live command line on Linux. ``None`` when it cannot be read."""
+    if pid <= 0 or not sys.platform.startswith("linux"):
+        return None
+    path = Path("/proc") / str(pid) / "cmdline"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    parts = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+    return parts or None
 
 
 def _posix_group_pids(pgid: int) -> set[int]:
@@ -527,18 +593,28 @@ def _win_start(proc: ManagedProcess, argv: list[str], cwd: Path, env: dict[str, 
         raise ProcessTreeError(f"CreateProcess failed: {error}")
 
     assigned = kernel32.AssignProcessToJobObject(job, process_info.hProcess)
+    if not assigned:
+        kernel32.TerminateProcess(process_info.hProcess, 1)
+        kernel32.CloseHandle(process_info.hThread)
+        kernel32.CloseHandle(process_info.hProcess)
+        kernel32.CloseHandle(job)
+        kernel32.CloseHandle(stdin_read)
+        kernel32.CloseHandle(stdin_write)
+        kernel32.CloseHandle(stdout_read)
+        kernel32.CloseHandle(stdout_write)
+        kernel32.CloseHandle(stderr_read)
+        kernel32.CloseHandle(stderr_write)
+        raise ProcessTreeError(
+            "refusing to run: AssignProcessToJobObject failed; the process was not resumed"
+        )
     kernel32.ResumeThread(process_info.hThread)
     proc._pid = int(process_info.dwProcessId)
     proc._group_id = proc._pid
     proc._process_handle = process_info.hProcess
     proc._thread_handle = process_info.hThread
     proc._proc = None
-    proc.kill_method = "job_object" if assigned else "taskkill"
-    if assigned:
-        proc._job = job
-    else:
-        kernel32.CloseHandle(job)
-        proc._job = None
+    proc.kill_method = "job_object"
+    proc._job = job
 
     kernel32.CloseHandle(stdin_read)
     kernel32.CloseHandle(stdout_write)
@@ -581,8 +657,17 @@ def _win_spawn_companion(owner: ManagedProcess, argv: list[str], cwd: Path) -> i
         ctypes.byref(process_info),
     ):
         raise ProcessTreeError(f"companion CreateProcess failed: {ctypes.get_last_error()}")
-    if owner._job:
-        kernel32.AssignProcessToJobObject(owner._job, process_info.hProcess)
+    if not owner._job:
+        kernel32.TerminateProcess(process_info.hProcess, 1)
+        kernel32.CloseHandle(process_info.hThread)
+        kernel32.CloseHandle(process_info.hProcess)
+        raise ProcessTreeError("refusing sidecar: runner has no job object")
+    assigned = kernel32.AssignProcessToJobObject(owner._job, process_info.hProcess)
+    if not assigned:
+        kernel32.TerminateProcess(process_info.hProcess, 1)
+        kernel32.CloseHandle(process_info.hThread)
+        kernel32.CloseHandle(process_info.hProcess)
+        raise ProcessTreeError("refusing sidecar: job assignment failed; process was not resumed")
     kernel32.ResumeThread(process_info.hThread)
     pid = int(process_info.dwProcessId)
     kernel32.CloseHandle(process_info.hThread)

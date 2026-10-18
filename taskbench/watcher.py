@@ -21,11 +21,14 @@ from typing import Any
 from taskbench.adapters import get_adapter
 from taskbench.adapters.base import Adapter, ProtocolError
 from taskbench.config import Config
+from taskbench.permissions import unexpected_permission
 from taskbench.process_tree import (
     ManagedProcess,
+    ProcessTreeError,
     kill_process_group,
     listening_ports,
     pid_alive,
+    read_cmdline,
 )
 from taskbench.projects import (
     compose_prompt,
@@ -251,8 +254,6 @@ class Watcher:
         packet["status"] = "running"
         packet["worker_thread"] = "run-" + os.urandom(2).hex()
         self.store.move_packet("claimed", "running", packet, f"{packet_id} claimed -> running")
-        self.proc = ManagedProcess(argv, folder, env)
-        self.deadline = time.monotonic() + timeout_s
         self.run_state = {
             "id": packet_id,
             "project": folder,
@@ -265,7 +266,20 @@ class Watcher:
             "pids": set(),
             "ports_seen": set(),
             "pending": None,
+            "cmdline_checked": False,
         }
+        try:
+            self.proc = ManagedProcess(argv, folder, env)
+        except (ProcessTreeError, OSError) as exc:
+            self.proc = None
+            self.deadline = None
+            return self._kill_and_finish(
+                packet,
+                "failed",
+                f"refusing to run without process confinement: {exc}",
+                killed=True,
+            )
+        self.deadline = time.monotonic() + timeout_s
         meta = {
             "started_epoch": time.time(),
             "timeout_s": timeout_s,
@@ -294,6 +308,8 @@ class Watcher:
             decision = self.store.read_meta(packet_id).get("decision")
             if decision == "approved":
                 self._apply_decision(packet, approved=True)
+                if self.proc is None:
+                    return str(packet.get("status") or "failed")
                 packet = self._packet_in("running") or packet
             elif decision == "denied":
                 self._mark_decision(packet, "denied")
@@ -301,6 +317,9 @@ class Watcher:
             else:
                 return "needs-approval"
         assert self.proc is not None
+        observed = self._observed_command_problem()
+        if observed:
+            return self._kill_and_finish(packet, "failed", observed, killed=True)
         while True:
             item = self.proc.poll_line()
             if item is None:
@@ -330,7 +349,32 @@ class Watcher:
             return "running"
         return self._finish_exit(packet, code)
 
+    def _observed_command_problem(self) -> str | None:
+        if self.run_state.get("cmdline_checked") or self.proc is None:
+            return None
+        self.run_state["cmdline_checked"] = True
+        argv = read_cmdline(self.proc.pid)
+        if not argv:
+            return None
+        from taskbench.permissions import PermissionFlagError, check_permission_args, iter_flags
+
+        try:
+            check_permission_args(argv)
+        except PermissionFlagError as exc:
+            return f"observed command line: {exc}"
+        flags = iter_flags(argv)
+        if not any(name == "permission-mode" for name, _value in flags):
+            return "observed command line is missing --permission-mode dontAsk"
+        flags = iter_flags(argv)
+        if not any(name == "sandbox" for name, _value in flags):
+            return "observed command line is missing --sandbox strict"
+        return None
+
     def _handle_event(self, packet: dict[str, Any], event: dict[str, Any]) -> str:
+        reason = unexpected_permission(event)
+        if reason:
+            self._kill_and_finish(packet, "failed", reason, killed=True)
+            return "terminal"
         kind = str(event.get("type") or "")
         if kind == "model":
             model = event.get("model")
@@ -385,6 +429,9 @@ class Watcher:
         if decision.kind == "allow":
             self.store.log(f"{packet['id']} allow-match {command}")
             self._execute_action(packet, action, command)
+            fatal = self._fail_if_unconfined(packet)
+            if fatal:
+                return fatal
             self._reply({"ok": True})
             return "continue"
         if decision.kind == "refuse":
@@ -422,6 +469,9 @@ class Watcher:
         self.store.log(f"{packet_id} approval approved {command}")
         if isinstance(action, dict):
             self._execute_action(packet, action, command)
+            if self.run_state.get("fatal"):
+                self._kill_and_finish(packet, "failed", str(self.run_state["fatal"]), killed=True)
+                return
         self._reply({"ok": True, "approved": True})
         packet["status"] = "running"
         meta = self.store.read_meta(packet_id)
@@ -467,6 +517,11 @@ class Watcher:
                     self.proc = ManagedProcess(shell_argv(command), folder, env)
                 else:
                     self.proc.spawn_companion(shell_argv(command), folder)
+            except ProcessTreeError as exc:
+                self.run_state["fatal"] = (
+                    f"refusing sidecar outside the process tree: {exc}"
+                )
+                return
             except Exception as exc:
                 self.store.append_output(packet_id, f"server error: {exc}\n")
                 return
@@ -478,11 +533,22 @@ class Watcher:
             return
         self._run_foreground_command(packet, command)
 
+    def _fail_if_unconfined(self, packet: dict[str, Any]) -> str | None:
+        reason = self.run_state.get("fatal")
+        if not reason:
+            return None
+        self._kill_and_finish(packet, "failed", str(reason), killed=True)
+        return "terminal"
+
     def _run_foreground_command(self, packet: dict[str, Any], command: str) -> None:
         folder: Path = self.run_state["project"]
         remaining = self._remaining()
         env = self.adapter.environment(os.environ.copy()) if self.adapter else os.environ.copy()
-        proc = ManagedProcess(shell_argv(command), folder, env)
+        try:
+            proc = ManagedProcess(shell_argv(command), folder, env)
+        except (ProcessTreeError, OSError) as exc:
+            self.run_state["fatal"] = f"refusing command without process confinement: {exc}"
+            return
         self.shell_proc = proc
         chunks: list[str] = []
         deadline = time.monotonic() + remaining
